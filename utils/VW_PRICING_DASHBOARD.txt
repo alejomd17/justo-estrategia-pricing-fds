@@ -1,0 +1,512 @@
+-- ============================================================
+--  VW_PRICING_DASHBOARD
+--  Vista maestra para Power BI - Pricing Dashboard
+--  Granularidad: 1 fila por SKU + TIENDA
+--  Tiendas: Atizapan (9) y Coyoacan (14)
+--
+--  CAMBIOS v4:
+--  1. AVG_COMP_LINE_PRICE: promedio precio de lista (PRICE_AMOUNT)
+--     sin descuento ni bundle, ultimos 7 dias
+--  2. COMPETITIVE_INDEX_LINE_PRICE: indice vs precio de linea
+--  3. TAG_COMPETITIVE_INDEX_LINE_PRICE: Mas caro / Parity / Mas barato
+--
+--  FIX encoding PRODUCT_ID (error "Numeric value '21690 ' is not
+--  recognized"):
+--  1. PRECIOS_RANKEADOS: h.PRODUCT_ID casteado a VARCHAR desde el
+--     origen para que el join no vuelva a intentar reconvertir un
+--     VARCHAR sucio a NUMBER.
+--  2. PROMO_SKU: PRODUCT_ID limpiado con REGEXP_REPLACE, quitando
+--     el caracter de encoding corrupto (UTF-8 replacement char)
+--     que traen 4 SKUs en DISCOUNT_CAMPAIGN_EVENT.
+-- ============================================================
+--Select * from MX_JUSTO_PROD.SANDBOX.VW_PRICING_DASHBOARD
+
+
+CREATE OR REPLACE VIEW MX_JUSTO_PROD.SANDBOX.VW_PRICING_DASHBOARD AS
+
+WITH
+
+-- ============================================================
+-- 1. MASTER CATALOG (solo SKUs con categoria)
+-- ============================================================
+CATALOG AS (
+    SELECT *
+    FROM MX_JUSTO_PROD.SANDBOX.FULL_MASTER_CATALOG
+    WHERE CATEGORY    IS NOT NULL
+      AND SUBCATEGORY IS NOT NULL
+      AND DEPARTMENT  IS NOT NULL
+),
+
+-- ============================================================
+-- 2. PRECIOS JUSTO (ultimo precio por SKU + Tienda)
+-- ============================================================
+PRECIOS AS (
+    WITH PRECIOS_RANKEADOS AS (
+        SELECT
+            h.PRODUCT_ID::VARCHAR AS PRODUCT_ID,                 -- ← FIX encoding
+            h.STORE_ID,
+            h.BRAND,
+            h.SEGMENT_ID,
+            h.COST,
+            h.MARGIN,
+            h.IEPS,
+            h.IVA,
+            h.IVF,
+            h.PRETAX_PRICE,
+            h.PRICE,
+            h.FINAL_PRICE,
+            h.NEXT_CREATED_AT,
+            h.LOADED_LAKED_DATE,
+            TO_DATE(h.LOADED_LAKED_DATE) AS FECHA_PRECIO,
+            ROW_NUMBER() OVER (
+                PARTITION BY
+                    h.PRODUCT_ID,
+                    h.STORE_ID,
+                    h.BRAND,
+                    TO_DATE(h.LOADED_LAKED_DATE)
+                ORDER BY
+                    h.LOADED_LAKED_DATE DESC,
+                    h.NEXT_CREATED_AT DESC
+            ) AS RN
+        FROM MX_JUSTO_PROD.DA_PRICING.PRICE_JUSTO_MS_HISTORY h
+        WHERE h.STORE_ID   IN (9, 14)
+          AND h.SEGMENT_ID  = 'default'
+          AND h.BRAND       = 'justo'
+    )
+    SELECT *
+    FROM PRECIOS_RANKEADOS
+    WHERE RN = 1
+),
+
+-- ============================================================
+-- 3. COMPETIDORES (promedio 7 dias - Walmart y Chedraui)
+-- ============================================================
+BASE_COMPETITORS AS (
+    SELECT
+        PRODUCT_ID,
+        WAREHOUSE_ID,
+        REGISTRATION_DATE,
+        COMPETITOR_BRAND,
+        PRICE_AMOUNT,                                        -- ← NUEVO v4
+        CASE
+            WHEN PRICE_WITH_DISCOUNT <= 0 THEN PRICE_AMOUNT
+            ELSE PRICE_WITH_DISCOUNT
+        END AS PRICE_WITH_DISCOUNT,
+        UNIT_PRICE_BUNDLE_ADJUSTED,
+        CASE
+            WHEN
+                CASE
+                    WHEN PRICE_WITH_DISCOUNT <= 0 THEN PRICE_AMOUNT
+                    ELSE PRICE_WITH_DISCOUNT
+                END <= UNIT_PRICE_BUNDLE_ADJUSTED
+            THEN
+                CASE
+                    WHEN PRICE_WITH_DISCOUNT <= 0 THEN PRICE_AMOUNT
+                    ELSE PRICE_WITH_DISCOUNT
+                END
+            ELSE UNIT_PRICE_BUNDLE_ADJUSTED
+        END AS COMPETITOR_FINAL_PRICE
+    FROM MX_JUSTO_PROD.DA_PRICING.PRICE_COMPETITOR_HISTORY
+    WHERE COMPETITOR_BRAND IN (
+            'WALMART',
+            'WALMART EXPRESS',
+            'CHEDRAUI',
+            'CHEDRAUI SELECTO'
+        )
+      AND REGISTRATION_DATE >= DATEADD(DAY, -7, CURRENT_DATE)
+      AND REGISTRATION_DATE <  CURRENT_DATE
+      AND YEAR(REGISTRATION_DATE) = 2026
+),
+
+COMPETITOR_AVG AS (
+    SELECT
+        PRODUCT_ID,
+        WAREHOUSE_ID,
+        MAX(REGISTRATION_DATE)                    AS LAST_REGISTRATION_DATE,
+        COUNT(DISTINCT COMPETITOR_BRAND)          AS TOTAL_COMPETITORS,
+        TRUNCATE(AVG(COMPETITOR_FINAL_PRICE), 2)  AS AVG_COMP_FINAL_PRICE,
+        TRUNCATE(AVG(PRICE_AMOUNT), 2)            AS AVG_COMP_LINE_PRICE    -- ← NUEVO v4
+    FROM BASE_COMPETITORS
+    WHERE COMPETITOR_FINAL_PRICE > 0
+    GROUP BY
+        PRODUCT_ID,
+        WAREHOUSE_ID
+),
+
+-- ============================================================
+-- 4. ELASTICIDAD (promedio por SKU)
+-- ============================================================
+ELASTICITY AS (
+    SELECT
+        PRODUCT_ID::VARCHAR AS PRODUCT_ID,
+        AVG(ELASTICITY_BY_SKU) AS ELASTICITY_BY_SKU
+    FROM MX_JUSTO_PROD.DR_GENERAL.ATHENEA
+    WHERE ELASTICITY_BY_SKU IS NOT NULL
+    GROUP BY 1
+),
+
+-- ============================================================
+-- 5. PROMOCIONES ACTIVAS
+-- ============================================================
+PROMO_SKU AS (
+    SELECT
+        PRODUCT_ID,
+        WAREHOUSE_ID,
+        MIN(START_DATE)                             AS START_DATE,
+        MAX(END_DATE)                               AS END_DATE,
+        MAX(BY_BULK_GET)                            AS BY_BULK_GET,
+        MAX(BY_BULK_PAY)                            AS BY_BULK_PAY,
+        MAX(BY_BULK_STRATEGY_DISCOUNT_TYPE)         AS BY_BULK_STRATEGY_DISCOUNT_TYPE,
+        MAX(BY_BULK_STRATEGY_VALUE)                 AS BY_BULK_STRATEGY_VALUE,
+        MAX(BY_BULK_NAME)                           AS BY_BULK_NAME,
+        COUNT(DISTINCT BRAND)                       AS NUM_BRANDS_PROMO,
+        CASE
+            WHEN CURRENT_DATE BETWEEN MIN(START_DATE) AND MAX(END_DATE)
+            THEN 'Con promocion'
+            ELSE 'Sin promocion'
+        END AS PROMO_ACTIVA,
+        CASE
+            WHEN MAX(BY_BULK_PAY) > 1
+                THEN 'Multicompra'
+            WHEN MAX(BY_BULK_STRATEGY_DISCOUNT_TYPE) = 'PERCENTAGE'
+                THEN 'Descuento %'
+            WHEN MAX(BY_BULK_STRATEGY_DISCOUNT_TYPE) = 'FIXED'
+                THEN 'Descuento $'
+            ELSE 'Otro'
+        END AS TIPO_PROMO
+    FROM (
+        SELECT
+            REGEXP_REPLACE(PRODUCT_ID, '[^0-9]', '') AS PRODUCT_ID,   -- ← FIX encoding
+            WAREHOUSE_ID,
+            START_DATE,
+            END_DATE,
+            BY_BULK_GET,
+            BY_BULK_PAY,
+            BY_BULK_STRATEGY_DISCOUNT_TYPE,
+            BY_BULK_STRATEGY_VALUE,
+            BY_BULK_NAME,
+            BRAND
+        FROM MX_JUSTO_PROD.ODS_MS_PRICING_V.DISCOUNT_CAMPAIGN_EVENT
+        WHERE START_DATE >= '2026-01-01'
+    )
+    GROUP BY
+        PRODUCT_ID,
+        WAREHOUSE_ID
+),
+
+-- ============================================================
+-- 6. ROTACION (ultimos 30 dias - solo tiendas 9 y 14)
+-- ============================================================
+ROTACION AS (
+    SELECT
+        PRODUCT_ID::VARCHAR                         AS PRODUCT_ID,
+        STORE_ID,
+        SUM(QUANTITY_FULFILLED_PZ)                  AS UNITS_30D,
+        SUM(AMOUNT_GROSS_DELIVERED)                 AS GMV_30D,
+        COUNT(DISTINCT ORDER_ID)                    AS ORDERS_30D
+    FROM DR_MASTER_TABLES.MASTER_ORDERLINE
+    WHERE STATUS_ORDER              = 'delivered'
+      AND TO_DATE(DATETIME_DELIVERY) >= DATEADD(DAY, -30, CURRENT_DATE)
+      AND TO_DATE(DATETIME_DELIVERY) <  CURRENT_DATE
+      AND STORE_ID                  IN (9, 14)
+      AND QUANTITY_FULFILLED_PZ      > 0
+    GROUP BY
+        PRODUCT_ID,
+        STORE_ID
+),
+
+-- ============================================================
+-- 7. PROMEDIO DE ROTACION POR SUBCATEGORIA
+-- ============================================================
+PROM_SUBCAT AS (
+    SELECT
+        C.SUBCATEGORY,
+        R.STORE_ID,
+        AVG(R.UNITS_30D) AS PROM_VTA_SUBCAT
+    FROM ROTACION R
+    JOIN CATALOG C ON R.PRODUCT_ID = C.SKU::VARCHAR
+    GROUP BY
+        C.SUBCATEGORY,
+        R.STORE_ID
+),
+
+-- ============================================================
+-- 8. PENETRACION (ultimos 30 dias)
+-- ============================================================
+PENETRATION AS (
+    SELECT
+        OL.PRODUCT_ID::VARCHAR                      AS PRODUCT_ID,
+        OL.STORE_ID,
+        COUNT(DISTINCT OL.ORDER_ID)                 AS ORDERS_SKU_30D,
+        DIV0(
+            COUNT(DISTINCT OL.ORDER_ID),
+            MAX(TOTAL.TOTAL_ORDERS_STORE)
+        ) * 100                                     AS PENETRATION_PCT_30D
+    FROM DR_MASTER_TABLES.MASTER_ORDERLINE OL
+    JOIN (
+        SELECT
+            STORE_ID,
+            COUNT(DISTINCT ORDER_ID) AS TOTAL_ORDERS_STORE
+        FROM DR_MASTER_TABLES.MASTER_ORDERLINE
+        WHERE STATUS_ORDER              = 'delivered'
+          AND TO_DATE(DATETIME_DELIVERY) >= DATEADD(DAY, -30, CURRENT_DATE)
+          AND TO_DATE(DATETIME_DELIVERY) <  CURRENT_DATE
+          AND STORE_ID                  IN (9, 14)
+        GROUP BY STORE_ID
+    ) TOTAL ON OL.STORE_ID = TOTAL.STORE_ID
+    WHERE OL.STATUS_ORDER              = 'delivered'
+      AND TO_DATE(OL.DATETIME_DELIVERY) >= DATEADD(DAY, -30, CURRENT_DATE)
+      AND TO_DATE(OL.DATETIME_DELIVERY) <  CURRENT_DATE
+      AND OL.STORE_ID                  IN (9, 14)
+      AND OL.QUANTITY_FULFILLED_PZ      > 0
+    GROUP BY
+        OL.PRODUCT_ID,
+        OL.STORE_ID
+),
+
+-- ============================================================
+-- 9. GMV TOTAL COMPANY (para calcular SHARE)
+-- ============================================================
+GMV_COMPANY AS (
+    SELECT
+        SUM(AMOUNT_GROSS_DELIVERED) AS GMV_TOTAL_30D
+    FROM DR_MASTER_TABLES.MASTER_ORDERLINE
+    WHERE STATUS_ORDER              = 'delivered'
+      AND TO_DATE(DATETIME_DELIVERY) >= DATEADD(DAY, -30, CURRENT_DATE)
+      AND TO_DATE(DATETIME_DELIVERY) <  CURRENT_DATE
+      AND STORE_ID                  IN (9, 14)
+      AND QUANTITY_FULFILLED_PZ      > 0
+),
+
+-- ============================================================
+-- 10. BASE: cruce de todas las fuentes
+-- ============================================================
+BASE AS (
+    SELECT
+        P.PRODUCT_ID,
+        P.STORE_ID,
+        C.PRODUCT_NAME,
+        C.SKU,
+        C.CATEGORY,
+        C.SUBCATEGORY,
+        C.DEPARTMENT,
+        C.BRAND,
+        C.IS_PRIVATE_LABEL,
+        C.STATUS,
+        C.SUPPLIER_NAME,
+        P.FINAL_PRICE,
+        P.COST,
+        P.MARGIN,
+        P.IEPS,
+        P.IVA,
+        P.FECHA_PRECIO,
+        CA.AVG_COMP_FINAL_PRICE,
+        CA.AVG_COMP_LINE_PRICE,                              -- ← NUEVO v4
+        CA.TOTAL_COMPETITORS,
+        CA.LAST_REGISTRATION_DATE,
+        -- índice vs precio final (descuento/bundle) — sin cambios
+        CASE
+            WHEN CA.AVG_COMP_FINAL_PRICE IS NULL
+              OR CA.AVG_COMP_FINAL_PRICE  = 0       THEN NULL
+            ELSE TRUNCATE(
+                    DIV0(P.FINAL_PRICE - CA.AVG_COMP_FINAL_PRICE,
+                         CA.AVG_COMP_FINAL_PRICE) * 100,
+                 2)
+        END                                                  AS COMPETITIVE_INDEX,
+        -- ← NUEVO v4: índice vs precio de línea
+        CASE
+            WHEN CA.AVG_COMP_LINE_PRICE IS NULL
+              OR CA.AVG_COMP_LINE_PRICE  = 0        THEN NULL
+            ELSE TRUNCATE(
+                    DIV0(P.FINAL_PRICE - CA.AVG_COMP_LINE_PRICE,
+                         CA.AVG_COMP_LINE_PRICE) * 100,
+                 2)
+        END                                                  AS COMPETITIVE_INDEX_LINE_PRICE,
+        TRUNCATE(E.ELASTICITY_BY_SKU, 4)                    AS ELASTICITY_BY_SKU,
+        COALESCE(PR.PROMO_ACTIVA, 'Sin promocion')          AS PROMO_ACTIVA,
+        PR.TIPO_PROMO,
+        PR.START_DATE                                        AS PROMO_START_DATE,
+        PR.END_DATE                                          AS PROMO_END_DATE,
+        COALESCE(R.UNITS_30D,  0)                           AS UNITS_30D,
+        COALESCE(R.GMV_30D,    0)                           AS GMV_30D,
+        COALESCE(R.ORDERS_30D, 0)                           AS ORDERS_30D,
+        PS.PROM_VTA_SUBCAT,
+        COALESCE(PEN.PENETRATION_PCT_30D, 0)                AS PENETRATION_PCT_30D,
+        GC.GMV_TOTAL_30D
+
+    FROM PRECIOS P
+    INNER JOIN CATALOG        C   ON  P.PRODUCT_ID = C.SKU::VARCHAR
+    LEFT  JOIN COMPETITOR_AVG CA  ON  P.PRODUCT_ID = CA.PRODUCT_ID
+                                  AND P.STORE_ID   = CA.WAREHOUSE_ID
+    LEFT  JOIN ELASTICITY     E   ON  P.PRODUCT_ID = E.PRODUCT_ID
+    LEFT  JOIN PROMO_SKU      PR  ON  P.PRODUCT_ID = PR.PRODUCT_ID
+                                  AND P.STORE_ID   = PR.WAREHOUSE_ID
+    LEFT  JOIN ROTACION       R   ON  P.PRODUCT_ID = R.PRODUCT_ID
+                                  AND P.STORE_ID   = R.STORE_ID
+    LEFT  JOIN PROM_SUBCAT    PS  ON  C.SUBCATEGORY = PS.SUBCATEGORY
+                                  AND P.STORE_ID   = PS.STORE_ID
+    LEFT  JOIN PENETRATION    PEN ON  P.PRODUCT_ID = PEN.PRODUCT_ID
+                                  AND P.STORE_ID   = PEN.STORE_ID
+    CROSS JOIN GMV_COMPANY    GC
+)
+
+-- ============================================================
+-- 11. SELECT FINAL CON TODOS LOS TAGS CALCULADOS
+-- ============================================================
+SELECT
+    B.*,
+
+    -- -------------------------------------------------------
+    -- TAG ELASTICIDAD
+    -- -------------------------------------------------------
+    CASE
+        WHEN B.ELASTICITY_BY_SKU IS NULL              THEN 'SIN DATOS'
+        WHEN B.ELASTICITY_BY_SKU <= -2                THEN 'ALTAMENTE ELASTICO'
+        WHEN B.ELASTICITY_BY_SKU  > -2
+         AND B.ELASTICITY_BY_SKU <= -1                THEN 'ELASTICO'
+        WHEN B.ELASTICITY_BY_SKU  > -1
+         AND B.ELASTICITY_BY_SKU <= -0.5              THEN 'POCO ELASTICO'
+        WHEN B.ELASTICITY_BY_SKU  > -0.5
+         AND B.ELASTICITY_BY_SKU  < 0                 THEN 'INELASTICO'
+        WHEN B.ELASTICITY_BY_SKU  = 0                 THEN 'SIN SENSIBILIDAD'
+        ELSE                                               'REVISAR'
+    END                                               AS ELASTICITY_TAG,
+
+    -- -------------------------------------------------------
+    -- TAG ROTACION (relativo al promedio de subcategoria)
+    -- -------------------------------------------------------
+    CASE
+        WHEN B.UNITS_30D = 0
+          OR B.UNITS_30D IS NULL                      THEN 'Sin rotacion'
+        WHEN B.UNITS_30D < B.PROM_VTA_SUBCAT * 0.95  THEN 'Baja rotacion'
+        WHEN B.UNITS_30D > B.PROM_VTA_SUBCAT * 1.05  THEN 'Alta rotacion'
+        ELSE                                               'Rotacion normal'
+    END                                               AS TAG_ROTACION,
+
+    -- -------------------------------------------------------
+    -- TAG MARGEN
+    -- -------------------------------------------------------
+    CASE
+        WHEN B.MARGIN IS NULL                         THEN 'SIN DATOS'
+        WHEN B.MARGIN  < 10                           THEN 'Menor al 10%'
+        WHEN B.MARGIN  < 20                           THEN '10% - 20%'
+        WHEN B.MARGIN  < 30                           THEN '20% - 30%'
+        WHEN B.MARGIN  < 40                           THEN '30% - 40%'
+        ELSE                                               'Mayor a 40%'
+    END                                               AS TAG_MARGEN,
+
+    -- -------------------------------------------------------
+    -- TAG INDICE COMPETITIVO — vs precio final (sin cambios)
+    -- -------------------------------------------------------
+    CASE
+        WHEN B.COMPETITIVE_INDEX IS NULL              THEN 'Sin comparativa'
+        WHEN B.COMPETITIVE_INDEX >= 5                 THEN 'Mas caro'
+        WHEN B.COMPETITIVE_INDEX >= 0                 THEN 'Parity'
+        ELSE                                               'Mas barato'
+    END                                               AS TAG_COMPETITIVE_INDEX,
+
+    -- -------------------------------------------------------
+    -- TAG INDICE COMPETITIVO — vs precio de línea ← NUEVO v4
+    -- -------------------------------------------------------
+    CASE
+        WHEN B.COMPETITIVE_INDEX_LINE_PRICE IS NULL   THEN 'Sin comparativa'
+        WHEN B.COMPETITIVE_INDEX_LINE_PRICE >= 5      THEN 'Mas caro'
+        WHEN B.COMPETITIVE_INDEX_LINE_PRICE >= 0      THEN 'Parity'
+        ELSE                                               'Mas barato'
+    END                                               AS TAG_COMPETITIVE_INDEX_LINE_PRICE,
+
+    -- -------------------------------------------------------
+    -- TAG SHARE GMV
+    -- -------------------------------------------------------
+    CASE
+        WHEN B.GMV_TOTAL_30D = 0
+          OR B.GMV_TOTAL_30D IS NULL                  THEN 'SIN DATOS'
+        WHEN DIV0(B.GMV_30D, B.GMV_TOTAL_30D)
+             >= AVG(DIV0(B.GMV_30D, B.GMV_TOTAL_30D))
+             OVER ()                                  THEN 'ALTO SHARE'
+        ELSE                                               'BAJO SHARE'
+    END                                               AS TAG_SHARE,
+
+    -- -------------------------------------------------------
+    -- SHARE GMV % (valor numerico)
+    -- -------------------------------------------------------
+    TRUNCATE(DIV0(B.GMV_30D, B.GMV_TOTAL_30D) * 100, 4)
+                                                      AS SHARE_GMV_PCT,
+
+    -- -------------------------------------------------------
+    -- DATA QUALITY FLAG
+    -- -------------------------------------------------------
+    CASE
+        WHEN B.COST        IS NULL OR B.COST        <= 0  THEN 'SIN COSTO'
+        WHEN B.FINAL_PRICE IS NULL OR B.FINAL_PRICE <= 0  THEN 'SIN PRECIO'
+        WHEN B.MARGIN      IS NULL                        THEN 'SIN MARGEN'
+        ELSE                                                   'OK'
+    END                                               AS DATA_QUALITY_FLAG,
+
+    -- -------------------------------------------------------
+    -- RECOMMENDATION TAG (v3: sin cambios)
+    -- -------------------------------------------------------
+    CASE
+
+        -- 1. PROMO ACTIVA → excluir del flujo de pricing
+        WHEN B.PROMO_ACTIVA = 'Con promocion'
+            THEN 'EN PROMOCION'
+
+        -- 2. CALIDAD DE DATO
+        WHEN B.COST        IS NULL OR B.COST        <= 0  THEN 'SIN COSTO'
+        WHEN B.FINAL_PRICE IS NULL OR B.FINAL_PRICE <= 0  THEN 'SIN PRECIO'
+        WHEN B.MARGIN      IS NULL                        THEN 'SIN MARGEN'
+
+        -- 3. MAS CARO → dos ramas segun margen
+        WHEN B.COMPETITIVE_INDEX >= 5
+         AND B.MARGIN > 22
+            THEN 'OPORTUNIDAD DE BAJAR PRECIO - MARGEN SUFICIENTE'
+
+        WHEN B.COMPETITIVE_INDEX >= 5
+         AND B.MARGIN <= 22
+            THEN 'REVISAR CON COMERCIAL - SIN ESPACIO DE PRECIO'
+
+        -- 4. SIN INDICE DE COMPETENCIA → sub-arbol propio
+        WHEN B.COMPETITIVE_INDEX IS NULL
+         AND B.UNITS_30D > 0
+            THEN 'SIN INFORMACION DE COMPETITIVIDAD'
+
+        WHEN B.COMPETITIVE_INDEX IS NULL
+         AND (B.UNITS_30D = 0 OR B.UNITS_30D IS NULL)
+         AND B.MARGIN > 22
+            THEN 'ALTO MARGEN SIN ROTACION - REVISAR ESTRATEGIA'
+
+        WHEN B.COMPETITIVE_INDEX IS NULL
+         AND (B.UNITS_30D = 0 OR B.UNITS_30D IS NULL)
+            THEN 'SIN INFO COMPETENCIA Y SIN ROTACION'
+
+        -- 5. TIENE INDICE → costo vs precio competencia
+        WHEN B.COST >= B.AVG_COMP_FINAL_PRICE
+            THEN 'REVISAR COSTO - COSTO MAYOR A PRECIO COMPETENCIA'
+
+        -- 6. SIN ROTACION (con indice, indice < 5%)
+        WHEN (B.UNITS_30D = 0 OR B.UNITS_30D IS NULL)
+         AND B.MARGIN < 10
+            THEN 'REVISAR CON COMERCIAL - BAJO MARGEN Y SIN ROTACION'
+
+        WHEN (B.UNITS_30D = 0 OR B.UNITS_30D IS NULL)
+         AND B.COMPETITIVE_INDEX > 0
+            THEN 'PRECIO NO COMPETITIVO Y SIN ROTACION'
+
+        WHEN (B.UNITS_30D = 0 OR B.UNITS_30D IS NULL)
+            THEN 'SIN ACCION'
+
+        -- 7. MAS BARATO
+        WHEN B.COMPETITIVE_INDEX < 0
+            THEN 'INDICE COMPETITIVO FAVORABLE - PRECIO POR DEBAJO DE COMPETENCIA'
+
+        -- 8. PARITY (0-4.99%) con rotacion
+        WHEN B.COMPETITIVE_INDEX >= 0
+         AND B.COMPETITIVE_INDEX < 5
+            THEN 'MONITOREAR PRECIO - SKU INELASTICO'
+
+        ELSE 'SIN ACCION'
+
+    END                                               AS RECOMMENDATION_TAG
+
+FROM BASE B;
