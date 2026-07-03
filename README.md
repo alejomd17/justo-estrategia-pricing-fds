@@ -6,14 +6,17 @@ Un análisis para armar la oferta de precios del próximo fin de semana (viernes
 
 El resultado final es un archivo Excel (`data/output/estrategia_fds.xlsx`) con la lista de productos recomendados, la promoción sugerida para cada uno, y una proyección de cuánto se espera vender.
 
+Esta versión integra el modelo de Joaquín Bolaños (Data Science, Pricing) con nuestros datos reales de Snowflake — ver la sección "Historial de este documento" al final para el detalle de qué aportó cada quién.
+
 ## De dónde salen los datos
 
 | Fuente | Qué aporta |
 |---|---|
 | `oportunidad.xlsx` | El universo de productos candidatos: ya viene filtrado para excluir marca propia y productos con promoción activa hoy. |
-| `Descuentos comerciales.xlsx` | Lista negra de productos que nunca se deben ofertar, y el calendario de promociones ya comprometidas por el equipo comercial. |
-| Catálogo de Snowflake | Departamento y categoría real de cada producto |
-| Histórico de ventas y elasticidad (Snowflake) | Qué tan sensible es cada producto a cambios de precio, y cuánto se vende normalmente, para poder proyectar el efecto de la oferta. |
+| `Descuentos comerciales.xlsx` | Lista negra de productos que nunca se deben ofertar, y el calendario de promociones ya comprometidas o eliminadas por el equipo comercial. |
+| Catálogo de Snowflake | Departamento y categoría real de cada producto. |
+| Elasticidad y ventas reales (Snowflake, Athenea) | Qué tan sensible es cada producto a cambios de precio, y cuánto se vende normalmente, para poder proyectar el efecto de la oferta — con datos reales por producto en vez de supuestos genéricos por categoría. |
+| Histórico de promociones y transacciones (Snowflake) | Para comparar lo que el modelo habría proyectado contra lo que realmente pasó en ofertas pasadas (backtesting). |
 | Estrategia FDS anterior (jun 2026) | Referencia de qué se hizo el fin de semana pasado. |
 
 ## Cómo se construyó la lista final
@@ -33,55 +36,97 @@ Esta es la única restricción que no se negocia: **ningún producto puede termi
 
 También se descartan los productos marcados como "inelásticos" o sin dato de sensibilidad al precio — ofertar un producto que no reacciona a cambios de precio no genera ningún beneficio, solo resta margen.
 
-### 4. Elegir la promoción de cada producto
+### 4. Priorizar: no todos los productos merecen el mismo esfuerzo
 
-Para cada producto que sobrevive los filtros anteriores, se calcula matemáticamente **el descuento más grande posible que ese producto puede aguantar sin romper el piso del 22% de margen.** Ese es el techo — nunca se ofrece menos descuento del que el margen permite.
+Antes de decidir el descuento, cada producto recibe un **puntaje de prioridad** según qué tan bien responde a precio (elasticidad) y qué tan bien se está vendiendo ya (rotación) — un producto que no reacciona a precio **o** que casi no se vende no suma nada al multiplicar esos dos factores, así que queda con prioridad cero. Se suma un punto extra si el producto ya pesa mucho en las ventas (alto share) y otro si es afín al Mundial. Ese puntaje determina **qué tanto del colchón de margen se autoriza a gastar** en el descuento — los productos de alta prioridad pueden usar hasta 25% de su colchón; los de baja prioridad, mucho menos o nada. Adicionalmente, a los productos que **ya están posicionados como más baratos que la competencia** se les recorta un poco el presupuesto de descuento: esa percepción de precio ya está "comprada", pagarla dos veces es desperdicio.
 
-Con ese techo, se decide cómo comunicarlo al cliente:
+### 5. Elegir la promoción de cada producto
 
-- Si el producto tiene margen suficiente para mecánicas tipo **"paga 1 y llévate 2" (2x1), "paga 2 y llévate 3" (3x2)**, o variantes similares, se usa esa mecánica — son más atractivas y fáciles de entender para el cliente que un simple "% de descuento".
-- Si no alcanza para ninguna de esas mecánicas, se ofrece el **descuento exacto** que sí es viable, presentado de la forma que más impacta al cliente: en **porcentaje** para productos baratos (menos de $100), o en **pesos** para productos caros (a partir de $100) — es un principio conocido de pricing: un "20% de descuento" en algo barato suena más grande que "$2 de descuento", pero en algo caro pasa lo contrario ("$50 de descuento" suena mejor que "16% off").
+Con el presupuesto de descuento ya definido (nunca más del colchón real de margen, y nunca más del 30% sin aprobación — ver punto 7), se decide la mecánica:
 
-### 5. Detección de productos relacionados con el Mundial
+- Si alcanza para mecánicas tipo **"paga 3 y llévate 4" (4x3), "paga 4 y llévate 5" (5x4)** o similares, se usa esa mecánica — comunican mejor que un "% de descuento" suelto.
+- Si no, se ofrece una mecánica flexible según el tipo de producto: **ahorro en pesos redondos** para productos de ticket alto (a partir de $150 — un "$50 de descuento" pesa más que un "%" cuando el producto es caro), **paquete a precio redondo** para productos baratos de alta rotación (ej. "3 x $99" — genera tráfico), o **% de descuento** por defecto.
+- **Toda mecánica exige comprar 2 o 3 unidades como mínimo.** El precio de un solo producto en el estante nunca cambia — quien compra 1 unidad paga precio completo, y el carrito crece. Esto es deliberado: significa que el costo real de la promoción **solo lo paga quien realmente activa la mecánica**, no el 100% de lo que se vende ese día (ver punto 7).
 
-Estamos en fechas de Mundial de fútbol (a jugarse parcialmente en México), así que se marcaron los productos típicos de "ver el partido en casa": cervezas, refrescos, botanas saladas, salsas picantes. No hay mercancía oficial con licencia FIFA en el catálogo, así que esto es una marca de referencia para que el equipo comercial decida si destacar estos productos con exhibición o banner especial — no cambia el orden ni el día de la oferta.
+### 6. Filtro nuevo: no descontar lo que ya se vende bien solo
 
-### 6. Día sugerido
+Esta es la pieza más importante que se agregó en esta versión. Antes, el único criterio para dar un descuento era "¿el margen aguanta?" — pero que el margen aguante no significa que valga la pena. Ahora, para cada oferta candidata se proyecta **si la venta extra que generaría el descuento realmente compensa lo que se está regalando de margen**. Si no compensa — es decir, si el producto ya se vende bien por sí solo y el descuento no le va a mover la aguja lo suficiente — **la oferta se descarta**, aunque el margen técnicamente lo permitiera. Es la diferencia entre "puedo dar este descuento" y "vale la pena dar este descuento".
 
-Cada producto se asigna a Viernes, Sábado o Domingo con una lógica simple:
+### 7. Tope de autonomía: 30% de descuento
 
-- **Domingo**: productos de Despensa (categoría de reabastecimiento antes de empezar la semana).
-- **Viernes**: productos de alta rotación (los que ya se venden mucho, para capturar tráfico desde el inicio del fin de semana).
-- **Sábado**: el resto — es el día "bandera" del fin de semana, donde cae la mayoría de la oferta.
+Cualquier producto cuyo colchón de margen permitiría (y ameritaría) más de 30% de descuento **no se oferta automáticamente** — se marca como *"requiere aprobación Comercial"* y se reporta en el archivo final con el descuento que tendría sentido, para que el equipo decida caso por caso. El sistema nunca publica solo una oferta tan agresiva.
 
-### 7. ¿Cuánto se espera vender? (validación de demanda)
+### 8. Detección de productos relacionados con el Mundial
 
-Elegir un descuento que no rompa el margen es solo la mitad del trabajo — la otra mitad es saber si esa oferta realmente va a mover ventas. Para eso se cruzó cada producto con:
+Estamos en fechas de Mundial de fútbol (con partidos en México), así que se marcaron los productos típicos de "ver el partido en casa": cervezas, refrescos, botanas saladas, totopos, palomitas, salsas picantes. No hay mercancía oficial con licencia FIFA en el catálogo, así que esto es un proxy de consumo, revisado a mano contra falsos positivos. Estos productos reciben prioridad extra (punto 4) y **corren tanto Sábado como Domingo** — hay partidos los dos días de este fin de semana.
 
-- Su **sensibilidad histórica al precio** (elasticidad): un número que indica cuánto sube la demanda cuando baja el precio.
-- Sus **ventas promedio actuales**, como punto de partida.
+### 9. Día sugerido
 
-Con eso se proyecta cuántas unidades por día se esperan vender con la oferta puesta, y cuánto más representa eso frente a la venta normal (el "uplift" proyectado).
+Con precedencia (la primera regla que aplica gana):
 
-**Nivel de confianza de cada proyección.** No todas las proyecciones son igual de confiables, así que cada producto queda etiquetado:
+1. **Mundial → Sábado y Domingo.**
+2. **Despensa → Domingo** (categoría de reabastecimiento antes de empezar la semana).
+3. **Alta rotación → Viernes** (capturar tráfico desde el arranque del fin de semana).
+4. **Ahorro en pesos, ticket alto → Domingo** (la compra de reposición se decide con más calma).
+5. **El resto → Sábado**, el día "bandera" del fin de semana.
 
-- **Alta**: el producto tiene su propio dato de sensibilidad al precio, y además ya tuvo una promoción real en el pasado con la que se puede comparar.
-- **Media**: tiene su propio dato de sensibilidad al precio, pero nunca se le ha probado una promoción real.
-- **Baja**: no hay dato propio de sensibilidad al precio; se usó un promedio de su categoría como aproximación.
+### 10. ¿Cuánto se espera vender? (validación de demanda)
 
-**Prueba contra la realidad (backtesting).** Para los productos que sí tuvieron promociones en el pasado, se comparó lo que la proyección hubiera dicho contra lo que realmente pasó en ventas. Esto permite decir, en una frase, si el modelo de sensibilidad al precio tiende a **quedarse corto o pasarse** al proyectar el efecto de una oferta — información clave para tomar la proyección de demanda con el grado de escepticismo correcto, no como una cifra exacta.
+Para cada oferta se proyecta cuántas unidades por día se esperan vender, usando la sensibilidad al precio del producto y sus ventas actuales como punto de partida — con un ajuste adicional: **una oferta anunciada con badge/precio tachado en la app genera más respuesta que el mismo cambio de precio pasando desapercibido**, así que el modelo amplifica la sensibilidad base para reflejar ese efecto de visibilidad.
+
+**Nivel de confianza de cada proyección.** No todas son igual de confiables:
+
+- **Alta**: el producto tiene su propio dato real de sensibilidad al precio, y además ya tuvo una promoción real en el pasado con la que se puede comparar.
+- **Media**: tiene su propio dato real, pero nunca se le ha probado una promoción real.
+- **Baja**: no hay dato propio — se usó un promedio de su categoría, o en último caso una magnitud típica declarada.
+
+**Prueba contra la realidad (backtesting).** Para los productos que sí tuvieron promociones reales en el pasado, se comparó lo que el modelo habría proyectado contra lo que realmente pasó en ventas. Esto valida no solo si la sensibilidad al precio está bien calibrada, sino también si el efecto de "visibilidad de la oferta" mencionado arriba es razonable — y dice en una frase si el modelo tiende a **quedarse corto o pasarse**.
 
 ## Qué NO hace este análisis (para ser transparentes)
 
 - No garantiza que el producto se va a vender exactamente lo proyectado — es una estimación estadística, con niveles de confianza distintos por producto.
 - No considera quiebres de inventario ni capacidad logística — solo pricing.
 - La detección de "Mundial" es una aproximación por nombre de producto, no un dato oficial de licencia.
-- El día sugerido usa una regla simple (categoría + rotación); no considera calendario de partidos, clima, ni otros factores externos al pricing.
+- El día sugerido usa una regla simple (categoría, rotación, ticket); no considera calendario de partidos, clima, ni otros factores externos al pricing.
+- El efecto de "visibilidad de la oferta" (punto 10) y las tasas de redención por mecánica (qué fracción de las unidades realmente se compra con la mecánica activa) son supuestos declarados, no medidos directamente — el backtesting los pone a prueba, pero no los reemplaza con un dato 100% real.
+- Los productos que requieren más de 30% de descuento no se ofertan solos — quedan pendientes de una decisión explícita de Comercial, no es una omisión del modelo.
 
 ## Cómo leer el archivo final
 
-`data/output/estrategia_fds.xlsx` trae una fila por producto y tienda, con: departamento/categoría, margen actual, mecánica de oferta recomendada, margen resultante, precio de oferta, cuánto se espera vender, qué tan confiable es esa proyección, día sugerido, y si es un producto afín al Mundial.
+`data/output/estrategia_fds.xlsx` tiene 6 hojas:
 
----
+- **Estrategia FDS**: solo los productos que sí llevan oferta (301 en la corrida más reciente) — departamento/categoría, mecánica, precio, margen resultante, día, si además requiere aprobación Comercial, cuánto se espera vender y qué tan confiable es esa proyección. Color verde = oferta normal, dorado = oferta Mundial, azul = requiere aprobación Comercial para ir más profundo.
+- **Descartados**: el resto del universo (2,171), con el motivo exacto por el que no lleva oferta — Black list, campaña comercial vigente, margen base insuficiente, inelástico, violación del piso al redondear, o descartada por utilidad incremental negativa. Sirve para auditar el modelo sin volver al notebook.
+- **Resumen**: indicadores globales, por día y por mecánica.
+- **Escenarios**: la proyección en 3 versiones (conservador / base / optimista) para ver qué tan sensible es el resultado al supuesto más incierto del modelo.
+- **Backtesting**: la comparación producto por producto entre lo proyectado y lo que realmente pasó en promociones pasadas.
+- **Leyenda**: diccionario de todas las columnas.
 
-*(Pendiente: agregar aquí el resumen de resultados de la corrida más reciente — total de productos incluidos, distribución por mecánica, por día, y conclusión del backtesting — en cuanto se comparta el output del notebook.)*
+## Resultados de la corrida actual (3-5 jul 2026)
+
+| Indicador | Valor |
+|---|---|
+| Universo total | 2,472 productos-tienda |
+| Ofertas asignadas | **301 (12.2%)** |
+| Requieren aprobación Comercial (>30% de descuento) | 14 |
+| Descuento exhibido promedio | 6.8% |
+| Margen mínimo en cualquier oferta | 22.03% (nunca por debajo del piso) |
+
+**Mecánica asignada:** SPON 166 · BNSP 75 · BNSDP 40 · 6x5 14 · 5x4 4 · 4x3 2.
+
+**Proyección del fin de semana (escenario base), solo días de oferta de cada producto:**
+- Unidades: 678 → 826 (**+21.8%**)
+- GMV: \$39,831 → \$47,929 (**+20.3%**)
+- Utilidad: \$12,405 → \$14,087 (**+13.6%**)
+
+**Por día:** Viernes 100 ofertas ($715 utilidad incremental) · Sábado 100 ($290) · Domingo 86 ($132) · Sábado y Domingo (Mundial) 15 ($545, la de mayor utilidad incremental por oferta).
+
+### ⚠️ El backtesting encontró un sesgo importante
+
+Al comparar la proyección del modelo contra lo que realmente pasó en 24,485 promociones históricas reales, el modelo **sobreestima el uplift real en 25.3 puntos porcentuales en promedio** (error absoluto medio de 48.5 puntos). Esto es una señal seria, no un detalle técnico: significa que **la proyección de +21.8% en unidades y +13.6% en utilidad de esta corrida probablemente es optimista** — el supuesto de "multiplicador promocional" (que la demanda responde más a una oferta anunciada que a la sensibilidad de lista) parece estar calibrado muy alto.
+
+Recomendación antes de tomar decisiones de negocio con estos números: bajar el multiplicador promocional (el cálculo sugiere algo cercano a 1.5 en vez de 2.0, aunque vale la pena revisarlo con más cuidado, no tomarlo como un ajuste final) y volver a correr, o al menos leer la columna "Confianza proyección" del Excel y tratar con más escepticismo las ofertas marcadas "Media"/"Baja". El guardrail de rentabilidad (punto 6) y el piso de margen (punto 2) siguen siendo válidos de todas formas — están basados en el margen real de cada producto, no en esta proyección de demanda.
+
+## Historial de este documento
+
+Esta estrategia combina dos líneas de trabajo: el modelo económico (priorización por score, mecánicas de volumen, guardrail de utilidad incremental, tope de autonomía, escenarios de sensibilidad) fue diseñado por **Joaquín Bolaños** (Data Science, Pricing); a partir de ahí se reemplazaron sus supuestos declarados de sensibilidad al precio y ventas base por datos reales de Snowflake, se agregó el departamento/categoría real de catálogo, y se sumó el backtesting contra promociones históricas reales.
