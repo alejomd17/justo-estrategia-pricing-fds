@@ -6,7 +6,7 @@ Un análisis para armar la oferta de precios del próximo fin de semana (viernes
 
 El resultado final es un archivo Excel (`data/output/estrategia_fds.xlsx`) con la lista de productos recomendados, la promoción sugerida para cada uno, y una proyección de cuánto se espera vender.
 
-Esta versión integra el modelo de Joaquín Bolaños (Data Science, Pricing) con nuestros datos reales de Snowflake — ver la sección "Historial de este documento" al final para el detalle de qué aportó cada quién.
+Esta versión integra dos líneas de trabajo — el modelo económico y los datos reales de Snowflake — ver la sección "Historial de este documento" al final para el detalle.
 
 ## De dónde salen los datos
 
@@ -129,4 +129,4 @@ Recomendación antes de tomar decisiones de negocio con estos números: bajar el
 
 ## Historial de este documento
 
-Esta estrategia combina dos líneas de trabajo: el modelo económico (priorización por score, mecánicas de volumen, guardrail de utilidad incremental, tope de autonomía, escenarios de sensibilidad) fue diseñado por **Joaquín Bolaños** (Data Science, Pricing); a partir de ahí se reemplazaron sus supuestos declarados de sensibilidad al precio y ventas base por datos reales de Snowflake, se agregó el departamento/categoría real de catálogo, y se sumó el backtesting contra promociones históricas reales.
+Esta estrategia es una integración de dos líneas de trabajo: el modelo económico (priorización por score, mecánicas de volumen, guardrail de utilidad incremental, tope de autonomía, escenarios de sensibilidad) se combinó con datos reales de Snowflake — reemplazando los supuestos declarados de sensibilidad al precio y ventas base por datos reales, agregando el departamento/categoría real de catálogo, y sumando el backtesting contra promociones históricas reales.
