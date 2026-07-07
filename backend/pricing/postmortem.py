@@ -280,6 +280,57 @@ def performance_por_mecanica(cur, campaign_start: pd.Timestamp, campaign_end: pd
     return pd.DataFrame(cur.fetchall(), columns=columnas)
 
 
+def listar_campanas(cur) -> pd.DataFrame:
+    """Ventanas de campana distintas ya subidas a WKND_PROMO_PLAN, para
+    poblar el selector del dashboard."""
+    cur.execute(f"""
+        SELECT DISTINCT CAMPAIGN_START, CAMPAIGN_END
+        FROM {SCHEMA}.WKND_PROMO_PLAN
+        ORDER BY CAMPAIGN_START DESC
+    """)
+    columnas = [c[0] for c in cur.description]
+    return pd.DataFrame(cur.fetchall(), columns=columnas)
+
+
+def resumen_adopcion(cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp) -> pd.DataFrame:
+    """SKU-tienda distintos por ORIGEN_CAMPANA en la ventana, y de esos
+    cuantos tuvieron venta con promo real (CON_PROMO). Filtra por FECHA, NO
+    por CAMPAIGN_START/CAMPAIGN_END: esas dos columnas de
+    WKND_PLAN_VS_ACTUAL_V vienen solo del lado de WKND_PROMO_PLAN, y son
+    NULL para las filas que en el FULL OUTER JOIN solo existen del lado de
+    WKND_PROMO_RESULTS_V (es decir, 'Otra fuente' y 'Sin promo') - filtrar
+    por esas columnas dejaria esos dos buckets siempre vacios."""
+    cur.execute(
+        f"""
+        SELECT
+            ORIGEN_CAMPANA,
+            COUNT(DISTINCT SKU || '-' || STORE_ID) AS SKU_TIENDAS,
+            COUNT(DISTINCT CASE WHEN CON_PROMO THEN SKU || '-' || STORE_ID END) AS SKU_TIENDAS_CON_PROMO_REAL
+        FROM {SCHEMA}.WKND_PLAN_VS_ACTUAL_V
+        WHERE FECHA BETWEEN %s AND %s
+        GROUP BY ORIGEN_CAMPANA
+        ORDER BY SKU_TIENDAS DESC
+        """,
+        (campaign_start.date(), campaign_end.date()),
+    )
+    columnas = [c[0] for c in cur.description]
+    return pd.DataFrame(cur.fetchall(), columns=columnas)
+
+
+def contar_plan(cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp) -> int:
+    """Total de filas planeadas (SKU x tienda) para la ventana, leido
+    directo de WKND_PROMO_PLAN. Denominador confiable para el % de adopcion
+    - a diferencia del bucket 'WKND' de resumen_adopcion (que depende de que
+    haya habido AL MENOS una venta en la ventana), esto cuenta el plan
+    completo, incluidos los SKUs planeados que terminaron sin ninguna
+    venta."""
+    cur.execute(
+        f"SELECT COUNT(*) FROM {SCHEMA}.WKND_PROMO_PLAN WHERE CAMPAIGN_START = %s AND CAMPAIGN_END = %s",
+        (campaign_start.date(), campaign_end.date()),
+    )
+    return cur.fetchone()[0]
+
+
 def plan_aun_no_ejecutado(weekend_fin: pd.Timestamp) -> bool:
     """True si el fin de semana del plan todavia no paso. En ese caso es
     seguro subir/sobreescribir el plan automaticamente al construirlo (cada
