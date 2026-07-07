@@ -1,0 +1,362 @@
+"""Post-mortem de promos FDS: crea/consulta los objetos en
+MX_JUSTO_PROD.SANDBOX definidos en el plan (ver
+/home/alejomd17/.claude/plans/vamos-a-cambiar-de-glowing-plum.md):
+
+- WKND_PROMO_RESULTS_V (VIEW): promos activas (cualquiera) x ventas reales,
+  grano SKU+tienda+dia. Sin fecha fija adentro - se filtra al consultarla.
+- WKND_PROMO_PLAN (TABLE): lo que nosotros planeamos, subido desde
+  estrategia_fds.xlsx.
+- WKND_PLAN_VS_ACTUAL_V (VIEW): join de las dos anteriores + ORIGEN_CAMPANA.
+- WKND_POSTMORTEM_PROMO_V (VIEW): insights agregados (performance por mecanica,
+  top ganadores/perdedores, oportunidades de subir precio).
+
+IMPORTANTE: este modulo esta escrito a partir de las columnas ya conocidas
+de DISCOUNT_CAMPAIGN_EVENT/MASTER_ORDERLINE/VW_PRICING_DASHBOARD, pero NO se
+ha podido probar contra Snowflake real (requiere SSO interactivo). Antes de
+confiar en el, correr la Fase 0 del plan (chequeo de FACT_FULFILLMENT_LINE y
+confirmar que las promos del FDS ya estan cargadas) y validar cada CREATE
+VIEW con un SELECT de sanity check, tal como dice la seccion de
+Verificacion del plan.
+"""
+
+import pandas as pd
+
+from .strategy import REDENCION
+
+SCHEMA = "MX_JUSTO_PROD.SANDBOX"
+
+
+def _tier_redencion(bulk_rule_buy, bulk_rule_pay):
+    """Mapea BULK_RULE_BUY/BULK_RULE_PAY de FACT_FULFILLMENT_LINE al mismo
+    agrupamiento de tiers que usa strategy.REDENCION.
+
+    BULK_RULE_BUY > BULK_RULE_PAY es un umbral real de cantidad (compra N,
+    paga N-1 - familia BNGM en produccion), equivalente a nuestro
+    2x1/3x2/4x3/5x4/6x5. Ahi si tiene sentido comparar contra el supuesto
+    declarado en REDENCION.
+
+    BULK_RULE_BUY == BULK_RULE_PAY (el caso mas comun en produccion para
+    SPON/BNSP/BNSDP) significa que esa ejecucion NO tuvo umbral de cantidad:
+    el descuento aplica desde la primera unidad, sin necesidad de juntar
+    varias - aunque nuestro modelo asuma esas mecanicas con umbral de 2-3
+    unidades. Ahi la redencion real es trivialmente ~100% (no hay nada que
+    "no redimir"), no es comparable contra el supuesto - se marca aparte
+    como 'sin_umbral'."""
+    if bulk_rule_buy is None or bulk_rule_pay is None:
+        return None
+    if bulk_rule_buy == bulk_rule_pay:
+        return "sin_umbral"
+    if bulk_rule_pay in (3, 4, 5) and bulk_rule_buy == bulk_rule_pay + 1:
+        return "multibuy_grande"  # 4x3 / 5x4 / 6x5
+    if bulk_rule_pay == 2 and bulk_rule_buy == 3:
+        return "pack_3"  # 3x2 / BNSP
+    if bulk_rule_pay == 1 and bulk_rule_buy == 2:
+        return "umbral_2"  # 2x1 / SPON / BNSDP de 2 unidades
+    return None
+
+
+def crear_fds_promo_results_v(cur) -> None:
+    """Vista recurrente: no tiene fecha fija, cualquier consumidor filtra
+    `WHERE FECHA BETWEEN ...` a la ventana que le interese. Clasifica
+    BY_BULK_GET/BY_BULK_PAY/BY_BULK_STRATEGY_DISCOUNT_TYPE en la misma
+    taxonomia de mecanica que usa strategy.py (2x1/3x2/4x3/5x4/6x5/SPON/BNSDP).
+    """
+    cur.execute(f"""
+        CREATE OR REPLACE VIEW {SCHEMA}.WKND_PROMO_RESULTS_V AS
+        WITH CAMPANAS AS (
+            SELECT
+                REGEXP_REPLACE(PRODUCT_ID, '[^0-9]', '') AS SKU,
+                WAREHOUSE_ID                              AS STORE_ID,
+                START_DATE,
+                END_DATE,
+                BY_BULK_STRATEGY_DISCOUNT_TYPE             AS TIPO_DESCUENTO,
+                BY_BULK_STRATEGY_VALUE                     AS VALOR_DESCUENTO,
+                BY_BULK_GET,
+                BY_BULK_PAY,
+                CASE
+                    WHEN BY_BULK_PAY = 1 AND BY_BULK_GET = 2 THEN '2x1'
+                    WHEN BY_BULK_PAY = 2 AND BY_BULK_GET = 3 THEN '3x2'
+                    WHEN BY_BULK_PAY = 3 AND BY_BULK_GET = 4 THEN '4x3'
+                    WHEN BY_BULK_PAY = 4 AND BY_BULK_GET = 5 THEN '5x4'
+                    WHEN BY_BULK_PAY = 5 AND BY_BULK_GET = 6 THEN '6x5'
+                    WHEN BY_BULK_STRATEGY_DISCOUNT_TYPE = 'PERCENTAGE' THEN 'SPON'
+                    WHEN BY_BULK_STRATEGY_DISCOUNT_TYPE = 'FIXED' THEN 'BNSDP'
+                    ELSE 'Otro'
+                END AS MECANICA
+            FROM MX_JUSTO_PROD.ODS_MS_PRICING_V.DISCOUNT_CAMPAIGN_EVENT
+            -- Rango amplio (no todo el historico) para no escanear de mas;
+            -- ajustar si se necesita ver campanas mas viejas.
+            WHERE START_DATE >= '2025-01-01'
+        ),
+        VENTAS AS (
+            SELECT
+                PRODUCT_ID::VARCHAR                     AS SKU,
+                STORE_ID,
+                TO_DATE(DATETIME_DELIVERY)               AS FECHA,
+                SUM(QUANTITY_FULFILLED_PZ)               AS UNIDADES,
+                SUM(AMOUNT_GROSS_DELIVERED)               AS GMV
+            FROM MX_JUSTO_PROD.DR_MASTER_TABLES.MASTER_ORDERLINE
+            WHERE STATUS_ORDER          = 'delivered'
+              AND STORE_ID              IN (9, 14)
+              AND QUANTITY_FULFILLED_PZ > 0
+              AND DATETIME_DELIVERY     >= '2025-01-01'
+            GROUP BY 1, 2, 3
+        )
+        SELECT
+            v.SKU,
+            v.STORE_ID,
+            v.FECHA,
+            v.UNIDADES,
+            v.GMV,
+            c.START_DATE  AS CAMPANA_INICIO,
+            c.END_DATE    AS CAMPANA_FIN,
+            c.MECANICA,
+            c.TIPO_DESCUENTO,
+            c.VALOR_DESCUENTO,
+            CASE WHEN c.SKU IS NOT NULL THEN TRUE ELSE FALSE END AS CON_PROMO
+        FROM VENTAS v
+        LEFT JOIN CAMPANAS c
+            ON v.SKU = c.SKU
+           AND v.STORE_ID = c.STORE_ID
+           AND v.FECHA BETWEEN c.START_DATE AND c.END_DATE
+    """)
+
+
+def crear_fds_promo_plan_tabla(cur) -> None:
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {SCHEMA}.WKND_PROMO_PLAN (
+            CAMPAIGN_START DATE,
+            CAMPAIGN_END DATE,
+            STORE_ID NUMBER,
+            SKU NUMBER,
+            MECANICA_PLANEADA VARCHAR,
+            PRECIO_OFERTA_PLANEADO FLOAT,
+            MARGEN_PLANEADO_PCT FLOAT,
+            GMV_PROYECTADO FLOAT,
+            UTIL_PROYECTADA FLOAT,
+            RUN_TIMESTAMP TIMESTAMP_NTZ
+        )
+    """)
+
+
+def subir_plan(
+    cur,
+    estrategia_df: pd.DataFrame,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    run_timestamp: pd.Timestamp,
+) -> int:
+    """Sube el plan (hoja 'Estrategia FDS' de estrategia_fds.xlsx) a
+    WKND_PROMO_PLAN. Borra primero cualquier fila previa de la misma ventana,
+    para que volver a subir un plan corregido no duplique. Devuelve cuantas
+    filas se insertaron.
+
+    `estrategia_df` debe traer al menos: STORE_ID, SKU, ESTRATEGIA,
+    PRECIO_OFERTA, MARGEN_OFERTA_%, GMV_PROY_DIA, UTIL_PROY_DIA.
+    """
+    cur.execute(
+        f"DELETE FROM {SCHEMA}.WKND_PROMO_PLAN WHERE CAMPAIGN_START = %s AND CAMPAIGN_END = %s",
+        (campaign_start.date(), campaign_end.date()),
+    )
+
+    # pd.Timestamp no lo entiende el conector en executemany (solo
+    # datetime.datetime nativo) - convertir antes de bindear.
+    run_timestamp_nativo = pd.Timestamp(run_timestamp).to_pydatetime()
+
+    filas = [
+        (
+            campaign_start.date(),
+            campaign_end.date(),
+            int(r["STORE_ID"]),
+            int(r["SKU"]),
+            r["ESTRATEGIA"],
+            float(r["PRECIO_OFERTA"]),
+            float(r["MARGEN_OFERTA_%"]) if pd.notna(r.get("MARGEN_OFERTA_%")) else None,
+            float(r["GMV_PROY_DIA"]) if pd.notna(r.get("GMV_PROY_DIA")) else None,
+            float(r["UTIL_PROY_DIA"]) if pd.notna(r.get("UTIL_PROY_DIA")) else None,
+            run_timestamp_nativo,
+        )
+        for _, r in estrategia_df.iterrows()
+    ]
+    if not filas:
+        return 0
+
+    cur.executemany(
+        f"""
+        INSERT INTO {SCHEMA}.WKND_PROMO_PLAN (
+            CAMPAIGN_START, CAMPAIGN_END, STORE_ID, SKU, MECANICA_PLANEADA,
+            PRECIO_OFERTA_PLANEADO, MARGEN_PLANEADO_PCT, GMV_PROYECTADO,
+            UTIL_PROYECTADA, RUN_TIMESTAMP
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        filas,
+    )
+    return len(filas)
+
+
+def crear_fds_plan_vs_actual_v(cur) -> None:
+    """ORIGEN_CAMPANA: 'WKND' si el SKU+tienda+ventana esta en
+    WKND_PROMO_PLAN; 'Otra fuente' si hay promo real pero
+    no es la nuestra; 'Sin promo' si ninguna de las dos."""
+    cur.execute(f"""
+        CREATE OR REPLACE VIEW {SCHEMA}.WKND_PLAN_VS_ACTUAL_V AS
+        SELECT
+            COALESCE(p.SKU, r.SKU)             AS SKU,
+            COALESCE(p.STORE_ID, r.STORE_ID)   AS STORE_ID,
+            p.CAMPAIGN_START,
+            p.CAMPAIGN_END,
+            p.MECANICA_PLANEADA,
+            p.PRECIO_OFERTA_PLANEADO,
+            p.MARGEN_PLANEADO_PCT,
+            p.GMV_PROYECTADO,
+            p.UTIL_PROYECTADA,
+            r.FECHA,
+            r.UNIDADES,
+            r.GMV,
+            r.MECANICA        AS MECANICA_EJECUTADA,
+            r.CON_PROMO,
+            CASE
+                WHEN p.SKU IS NOT NULL THEN 'WKND'
+                WHEN r.CON_PROMO THEN 'Otra fuente'
+                ELSE 'Sin promo'
+            END AS ORIGEN_CAMPANA
+        FROM {SCHEMA}.WKND_PROMO_PLAN p
+        FULL OUTER JOIN {SCHEMA}.WKND_PROMO_RESULTS_V r
+            ON p.SKU = r.SKU
+           AND p.STORE_ID = r.STORE_ID
+           AND r.FECHA BETWEEN p.CAMPAIGN_START AND p.CAMPAIGN_END
+    """)
+
+
+def crear_postmortem_promo_v(cur) -> None:
+    """Insights agregados sobre WKND_PLAN_VS_ACTUAL_V (hereda ORIGEN_CAMPANA)
+    + VW_PRICING_DASHBOARD para margen/costo real. No se ignoran
+    PROMO_ACTIVA/30-dias de esa vista porque no se seleccionan aqui."""
+    cur.execute(f"""
+        CREATE OR REPLACE VIEW {SCHEMA}.WKND_POSTMORTEM_PROMO_V AS
+        SELECT
+            pva.SKU,
+            pva.STORE_ID,
+            pva.CAMPAIGN_START,
+            pva.CAMPAIGN_END,
+            pva.FECHA,
+            pva.MECANICA_EJECUTADA,
+            pva.ORIGEN_CAMPANA,
+            pva.UNIDADES,
+            pva.GMV,
+            pva.GMV_PROYECTADO,
+            pva.UTIL_PROYECTADA,
+            vpd.MARGIN,
+            vpd.COST,
+            vpd.FINAL_PRICE
+        FROM {SCHEMA}.WKND_PLAN_VS_ACTUAL_V pva
+        LEFT JOIN {SCHEMA}.VW_PRICING_DASHBOARD vpd
+            ON pva.SKU = vpd.SKU
+           AND pva.STORE_ID = vpd.STORE_ID
+    """)
+
+
+def performance_por_mecanica(cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp) -> pd.DataFrame:
+    """GMV/unidades/margen promedio por mecanica y por ORIGEN_CAMPANA, para
+    la ventana dada - responde '¿gano SPON o 6x5?' sin mezclar lo nuestro
+    con promos de otros equipos."""
+    cur.execute(
+        f"""
+        SELECT
+            MECANICA_EJECUTADA,
+            ORIGEN_CAMPANA,
+            COUNT(DISTINCT SKU || '-' || STORE_ID) AS SKUS,
+            SUM(UNIDADES) AS UNIDADES_TOTALES,
+            SUM(GMV) AS GMV_TOTAL,
+            AVG(MARGIN) AS MARGEN_PROMEDIO
+        FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
+        WHERE FECHA BETWEEN %s AND %s
+        GROUP BY MECANICA_EJECUTADA, ORIGEN_CAMPANA
+        ORDER BY GMV_TOTAL DESC
+        """,
+        (campaign_start.date(), campaign_end.date()),
+    )
+    columnas = [c[0] for c in cur.description]
+    return pd.DataFrame(cur.fetchall(), columns=columnas)
+
+
+def plan_aun_no_ejecutado(weekend_fin: pd.Timestamp) -> bool:
+    """True si el fin de semana del plan todavia no paso. En ese caso es
+    seguro subir/sobreescribir el plan automaticamente al construirlo (cada
+    corrida reemplaza a la anterior) porque no hay un registro historico
+    real que se pueda pisar por error - eso solo puede pasar despues de que
+    el fin de semana ya se ejecuto."""
+    return pd.Timestamp.now().normalize() <= pd.Timestamp(weekend_fin).normalize()
+
+
+def subir_plan_y_crear_vistas(
+    cur,
+    estrategia_df: pd.DataFrame,
+    weekend_inicio: pd.Timestamp,
+    weekend_fin: pd.Timestamp,
+) -> int:
+    """Sube `estrategia_df` a WKND_PROMO_PLAN y crea/reemplaza las 3 vistas
+    de post-mortem. Comun a los dos flujos de subida: automatico al construir
+    un plan para un finde que todavia no pasa, y manual (leyendo el Excel
+    real desde disco) para un finde ya ejecutado. `estrategia_df` debe traer
+    las columnas que pide `subir_plan` (ver su docstring)."""
+    crear_fds_promo_results_v(cur)
+    crear_fds_promo_plan_tabla(cur)
+    n = subir_plan(cur, estrategia_df, weekend_inicio, weekend_fin, pd.Timestamp.now())
+    crear_fds_plan_vs_actual_v(cur)
+    crear_postmortem_promo_v(cur)
+    return n
+
+
+def crear_objetos_postmortem(cur) -> None:
+    """Crea/reemplaza los 3 objetos que no dependen del plan subido
+    (WKND_PROMO_RESULTS_V) y la tabla del plan. WKND_PLAN_VS_ACTUAL_V y
+    WKND_POSTMORTEM_PROMO_V se crean por separado, despues de subir el plan con
+    `subir_plan`, para que el primer CREATE no falle por WKND_PROMO_PLAN
+    vacia (aunque CREATE TABLE IF NOT EXISTS ya la deja vacia y valida)."""
+    crear_fds_promo_results_v(cur)
+    crear_fds_promo_plan_tabla(cur)
+    crear_fds_plan_vs_actual_v(cur)
+    crear_postmortem_promo_v(cur)
+
+
+def validar_redencion_real(cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp) -> pd.DataFrame:
+    """Compara la tasa de redencion REAL (IS_DISCOUNT/IS_BULK_APPLIED a nivel
+    de linea de pedido en FACT_FULFILLMENT_LINE) contra los supuestos
+    declarados en `strategy.REDENCION` (35%/40%/55%), para la ventana dada.
+
+    Requiere acceso a MX_JUSTO_PROD.DM_CORE.FACT_FULFILLMENT_LINE - se
+    confirmo en vivo que es accesible con el rol DATA_BI (ver Fase 0 del
+    plan). Usa DELIVERED_DATE IS NOT NULL como filtro de "efectivamente
+    entregado" en vez de adivinar los valores validos de ORDER_STATUS.
+    """
+    cur.execute(
+        """
+        SELECT
+            BULK_STRATEGY,
+            BULK_RULE_BUY,
+            BULK_RULE_PAY,
+            SUM(QUANTITY) AS UNIDADES_TOTALES,
+            SUM(CASE WHEN IS_DISCOUNT OR IS_BULK_APPLIED THEN QUANTITY ELSE 0 END) AS UNIDADES_CON_DESCUENTO
+        FROM MX_JUSTO_PROD.DM_CORE.FACT_FULFILLMENT_LINE
+        WHERE WAREHOUSE_ID IN (9, 14)
+          AND DELIVERED_DATE IS NOT NULL
+          AND DELIVERED_DATE BETWEEN %s AND %s
+        GROUP BY BULK_STRATEGY, BULK_RULE_BUY, BULK_RULE_PAY
+        """,
+        (campaign_start.date(), campaign_end.date()),
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+
+    df["TIER"] = df.apply(lambda r: _tier_redencion(r["BULK_RULE_BUY"], r["BULK_RULE_PAY"]), axis=1)
+    df["REDENCION_REAL"] = (df["UNIDADES_CON_DESCUENTO"] / df["UNIDADES_TOTALES"]).round(4)
+    # 'sin_umbral' no esta en strategy.REDENCION (no es una mecanica nuestra,
+    # es la ausencia de umbral en la ejecucion real) - se compara contra 1.0
+    # porque sin umbral el descuento aplica siempre, trivialmente.
+    tier_a_supuesta = {**REDENCION, "sin_umbral": 1.0}
+    df["REDENCION_SUPUESTA"] = df["TIER"].map(tier_a_supuesta)
+    df["DIFERENCIA"] = (df["REDENCION_REAL"] - df["REDENCION_SUPUESTA"]).round(4)
+    return df.sort_values("UNIDADES_TOTALES", ascending=False)

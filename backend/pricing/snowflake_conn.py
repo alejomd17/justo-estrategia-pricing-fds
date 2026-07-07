@@ -7,6 +7,11 @@ load_dotenv()
 
 
 def get_connection():
+    """Conexion SSO interactiva (abre navegador) - usada por el notebook.
+
+    Para procesos desatendidos (backend FastAPI) no sirve: ver nota de
+    conexion persistente de un solo login en el plan de la Fase 4.
+    """
     return snowflake.connector.connect(
         account=os.environ["SNOWFLAKE_ACCOUNT"],
         user=os.environ["SNOWFLAKE_USER"],
