@@ -24,6 +24,20 @@ def get_full_master_catalog(cur) -> pd.DataFrame:
     return catalogo
 
 
+def get_departamentos_categorias(cur) -> pd.DataFrame:
+    """Departamento/Categoria distintos, para poblar los filtros del
+    dashboard (Fase 5)."""
+    cur.execute("""
+        SELECT DISTINCT DEPARTMENT, CATEGORY
+        FROM MX_JUSTO_PROD.SANDBOX.FULL_MASTER_CATALOG
+        WHERE DEPARTMENT IS NOT NULL AND CATEGORY IS NOT NULL
+        ORDER BY 1, 2
+    """)
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    return df.rename(columns={"DEPARTMENT": "Departamento", "CATEGORY": "Categoria"})
+
+
 def get_pricing_dashboard(cur, skus=None) -> pd.DataFrame:
     """COST/MARGIN/FINAL_PRICE/IEPS/IVA reales por SKU+tienda, para el
     post-mortem (Fase 3 del plan). Se usa SOLO para margen/costo - se

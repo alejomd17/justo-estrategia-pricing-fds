@@ -13,7 +13,7 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from . import catalog, elasticity
+from . import catalog, elasticity, rotacion
 
 # ---------- Reglas de margen ----------
 PISO_MARGEN = 0.22
@@ -55,6 +55,10 @@ PATRON_MUNDIAL = re.compile(
 # ---------- Pesos del score ----------
 ELAS_W = {"ALTAMENTE ELASTICO": 3, "ELASTICO": 2, "POCO ELASTICO": 1, "INELASTICO": 0, "SIN DATOS": 0}
 ROT_W = {"Alta rotacion": 3, "Rotacion normal": 2, "Baja rotacion": 1, "Sin rotacion": 0}
+# Bono real (no el TAG_ROTACION estatico) por rotar mas rapido que el
+# promedio de su categoria (rotacion.py) - acotado a [-1, +1], mismo orden
+# de magnitud que el bono de TAG_SHARE/Mundial, para no dominar el score.
+PESO_ROTACION_REAL = 1.0
 
 
 def cargar_oportunidad(ruta_oportunidad: str) -> pd.DataFrame:
@@ -124,6 +128,27 @@ def agregar_catalogo_real(df: pd.DataFrame, cur) -> pd.DataFrame:
     return df.merge(catalogo_df, on="SKU", how="left")
 
 
+def agregar_rotacion_real(df: pd.DataFrame, cur) -> pd.DataFrame:
+    """Merge con el baseline real de rotacion por categoria (rotacion.py,
+    catalogo completo - no acotado al universo de oportunidad.xlsx) y
+    calcula ROTACION_REAL_RATIO = rotacion propia del SKU / baseline de su
+    categoria. df ya debe traer Categoria (merge previo con
+    agregar_catalogo_real)."""
+    baseline = rotacion.get_baseline_categoria(cur)
+    cols_baseline = [
+        "SKU",
+        "STORE_ID",
+        "UNIDADES_DIA_SKU_TIENDA",
+        "DIAS_ENTRE_VENTA_SKU_TIENDA",
+        "UNIDADES_DIA_CATEGORIA_BASELINE",
+        "DIAS_ENTRE_VENTA_CATEGORIA_BASELINE",
+        "FUENTE_BASELINE_CATEGORIA",
+    ]
+    df = df.merge(baseline[cols_baseline], on=["SKU", "STORE_ID"], how="left")
+    df["ROTACION_REAL_RATIO"] = df["UNIDADES_DIA_SKU_TIENDA"] / df["UNIDADES_DIA_CATEGORIA_BASELINE"]
+    return df
+
+
 def calcular_margen_neto(df: pd.DataFrame) -> pd.DataFrame:
     """Agrega PRECIO_NETO (util para pesos de utilidad mas abajo). No
     reconstruye MARGEN - esa columna del export es la fuente de verdad."""
@@ -174,10 +199,15 @@ def _tope_por_score(s):
 def calcular_score_y_tope(df: pd.DataFrame) -> pd.DataFrame:
     df["W_ELAS"] = df["TAG ELAS"].map(ELAS_W).fillna(0)
     df["W_ROT"] = df["TAG_ROTACION"].map(ROT_W).fillna(0)
+    # Ratio real de rotacion vs. su categoria (rotacion=1 -> en linea con la
+    # categoria) llevado a un bono acotado [-1, +1] - sin baseline (NaN) no
+    # suma ni resta.
+    bono_rotacion_real = (df["ROTACION_REAL_RATIO"].clip(upper=2) - 1).clip(lower=-1).fillna(0)
     df["SCORE"] = (
         df["W_ELAS"] * df["W_ROT"]
         + (df["TAG_SHARE"] == "ALTO SHARE").astype(int)
         + df["TEMA_MUNDIAL"].astype(int) * BOOST_MUNDIAL
+        + bono_rotacion_real * PESO_ROTACION_REAL
     )
 
     df["TOPE"] = df["SCORE"].apply(_tope_por_score)
@@ -469,6 +499,8 @@ def exportar_excel(
         "STORE_ID", "SKU", "Nombre", "Departamento", "Categoria", "COSTO", "IEPS", "IVA",
         "MARGEN", "PRECIO JUSTO", "TAG_MARGEN", "INDEX PRECIO DCTO", "PRECIO COMP DCTO",
         "PRECIO COMP LINEA", "INDEX PRECIO LINEA", "TAG_ROTACION", "TAG_SHARE", "TAG ELAS",
+        "ROTACION_REAL_RATIO", "DIAS_ENTRE_VENTA_SKU_TIENDA", "DIAS_ENTRE_VENTA_CATEGORIA_BASELINE",
+        "FUENTE_BASELINE_CATEGORIA",
         "PROMO ACTIVA HOY", "TEMA_MUNDIAL", "MOTIVO_SIN_OFERTA", "REQUIERE_APROBACION",
         "DMAX_REAL", "ESTRATEGIA", "DIA_EJECUCION", "PRECIO_OFERTA", "DESC_EFECTIVO",
         "MARGEN_OFERTA", "FUENTE_ELASTICIDAD", "FUENTE_Q0", "CONFIANZA_PROYECCION",
@@ -479,6 +511,9 @@ def exportar_excel(
     out["DESC_EFECTIVO"] = (out["DESC_EFECTIVO"] * 100).round(1)
     out["DMAX_REAL"] = (out["DMAX_REAL"] * 100).round(1)
     out["UPLIFT"] = (out["UPLIFT"] * 100).round(0)
+    out["ROTACION_REAL_RATIO"] = out["ROTACION_REAL_RATIO"].round(2)
+    out["DIAS_ENTRE_VENTA_SKU_TIENDA"] = out["DIAS_ENTRE_VENTA_SKU_TIENDA"].round(1)
+    out["DIAS_ENTRE_VENTA_CATEGORIA_BASELINE"] = out["DIAS_ENTRE_VENTA_CATEGORIA_BASELINE"].round(1)
     out = out.rename(
         columns={
             "DESC_EFECTIVO": "DESC_EFECTIVO_%",
@@ -529,6 +564,9 @@ def exportar_excel(
             ("MOTIVO_SIN_OFERTA", "Por que la fila no lleva oferta (solo aplica en la hoja Descartados)"),
             ("REQUIERE_APROBACION / DMAX_REAL_%", "True si el colchon de margen real supera el tope autonomo de 30%; DMAX_REAL_% es ese colchon completo"),
             ("TEMA_MUNDIAL", "True si el nombre coincide con el patron de consumo 'ver el partido'"),
+            ("ROTACION_REAL_RATIO", "Unidades/dia real del SKU dividido entre el promedio real de su categoria (rotacion.py) - 1.0 = en linea con su categoria, ya no depende solo del TAG_ROTACION estatico"),
+            ("DIAS_ENTRE_VENTA_SKU_TIENDA / _CATEGORIA_BASELINE", "Dias promedio entre una venta y otra: del SKU, y el tipico de su categoria - para comparar ritmos de compra justo (ej. platano vs cepillo de dientes)"),
+            ("FUENTE_BASELINE_CATEGORIA", "Categoria x tienda / Categoria (ambas tiendas) / Sin baseline - de donde salio el baseline de rotacion de la categoria"),
             ("ESTRATEGIA / DIA_EJECUCION", "Mecanica asignada y dia(s) del FDS en que corre"),
             ("PRECIO_OFERTA", "Precio por unidad cuando la mecanica se activa"),
             ("DESC_EFECTIVO_% / MARGEN_OFERTA_%", "Profundidad exhibida y pure margin de las unidades en promocion"),
@@ -654,6 +692,7 @@ def construir_estrategia(
 
     df = excluir_comercial(df, ruta_descuentos, weekend_inicio, weekend_fin)
     df = agregar_catalogo_real(df, cur)
+    df = agregar_rotacion_real(df, cur)
     df = calcular_margen_neto(df)
     df = marcar_elegibilidad(df)
     df = detectar_tema_mundial(df)

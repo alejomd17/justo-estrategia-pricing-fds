@@ -21,6 +21,7 @@ Verificacion del plan.
 
 import pandas as pd
 
+from . import rotacion
 from .strategy import REDENCION
 
 SCHEMA = "MX_JUSTO_PROD.SANDBOX"
@@ -60,6 +61,9 @@ def crear_fds_promo_results_v(cur) -> None:
     `WHERE FECHA BETWEEN ...` a la ventana que le interese. Clasifica
     BY_BULK_GET/BY_BULK_PAY/BY_BULK_STRATEGY_DISCOUNT_TYPE en la misma
     taxonomia de mecanica que usa strategy.py (2x1/3x2/4x3/5x4/6x5/SPON/BNSDP).
+    Lo que no encaja en esa taxonomia NO se agrupa como "Otro" - se deja el
+    valor real de BY_BULK_STRATEGY_DISCOUNT_TYPE tal cual, para poder ver
+    que mecanica es de verdad en vez de un cajon generico.
     """
     cur.execute(f"""
         CREATE OR REPLACE VIEW {SCHEMA}.WKND_PROMO_RESULTS_V AS
@@ -81,7 +85,7 @@ def crear_fds_promo_results_v(cur) -> None:
                     WHEN BY_BULK_PAY = 5 AND BY_BULK_GET = 6 THEN '6x5'
                     WHEN BY_BULK_STRATEGY_DISCOUNT_TYPE = 'PERCENTAGE' THEN 'SPON'
                     WHEN BY_BULK_STRATEGY_DISCOUNT_TYPE = 'FIXED' THEN 'BNSDP'
-                    ELSE 'Otro'
+                    ELSE COALESCE(BY_BULK_STRATEGY_DISCOUNT_TYPE, 'Sin dato')
                 END AS MECANICA
             FROM MX_JUSTO_PROD.ODS_MS_PRICING_V.DISCOUNT_CAMPAIGN_EVENT
             -- Rango amplio (no todo el historico) para no escanear de mas;
@@ -230,8 +234,10 @@ def crear_fds_plan_vs_actual_v(cur) -> None:
 
 def crear_postmortem_promo_v(cur) -> None:
     """Insights agregados sobre WKND_PLAN_VS_ACTUAL_V (hereda ORIGEN_CAMPANA)
-    + VW_PRICING_DASHBOARD para margen/costo real. No se ignoran
-    PROMO_ACTIVA/30-dias de esa vista porque no se seleccionan aqui."""
+    + VW_PRICING_DASHBOARD para margen/costo real + FULL_MASTER_CATALOG para
+    Departamento/Categoria (Fase 5 - filtros del dashboard y traccion por
+    categoria). No se ignoran PROMO_ACTIVA/30-dias de VW_PRICING_DASHBOARD
+    porque no se seleccionan aqui."""
     cur.execute(f"""
         CREATE OR REPLACE VIEW {SCHEMA}.WKND_POSTMORTEM_PROMO_V AS
         SELECT
@@ -240,44 +246,114 @@ def crear_postmortem_promo_v(cur) -> None:
             pva.CAMPAIGN_START,
             pva.CAMPAIGN_END,
             pva.FECHA,
+            pva.MECANICA_PLANEADA,
             pva.MECANICA_EJECUTADA,
             pva.ORIGEN_CAMPANA,
             pva.UNIDADES,
             pva.GMV,
             pva.GMV_PROYECTADO,
             pva.UTIL_PROYECTADA,
+            pva.CON_PROMO,
             vpd.MARGIN,
             vpd.COST,
-            vpd.FINAL_PRICE
+            vpd.FINAL_PRICE,
+            fmc.DEPARTMENT AS DEPARTAMENTO,
+            fmc.CATEGORY   AS CATEGORIA
         FROM {SCHEMA}.WKND_PLAN_VS_ACTUAL_V pva
         LEFT JOIN {SCHEMA}.VW_PRICING_DASHBOARD vpd
             ON pva.SKU = vpd.SKU
            AND pva.STORE_ID = vpd.STORE_ID
+        LEFT JOIN {SCHEMA}.FULL_MASTER_CATALOG fmc
+            ON TRY_TO_NUMBER(pva.SKU::VARCHAR) = TRY_TO_NUMBER(fmc.SKU::VARCHAR)
     """)
 
 
-def performance_por_mecanica(cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp) -> pd.DataFrame:
-    """GMV/unidades/margen promedio por mecanica y por ORIGEN_CAMPANA, para
-    la ventana dada - responde '¿gano SPON o 6x5?' sin mezclar lo nuestro
-    con promos de otros equipos."""
+def _filtros_departamento_categoria_tienda(departamento=None, categoria=None, store_id=None, origen=None):
+    """Cláusulas/params opcionales compartidas por performance_por_mecanica,
+    resumen_adopcion y top_skus - mismo patrón de condición armada en Python
+    que ya usa catalog.get_pricing_dashboard con su parametro `skus`.
+    `origen` filtra por ORIGEN_CAMPANA ('WKND' / 'Otra fuente' / 'Sin promo')."""
+    condiciones = []
+    params = []
+    if departamento:
+        condiciones.append("DEPARTAMENTO = %s")
+        params.append(departamento)
+    if categoria:
+        condiciones.append("CATEGORIA = %s")
+        params.append(categoria)
+    if store_id:
+        condiciones.append("STORE_ID = %s")
+        params.append(int(store_id))
+    if origen:
+        condiciones.append("ORIGEN_CAMPANA = %s")
+        params.append(origen)
+    return condiciones, params
+
+
+def performance_por_mecanica(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+    origen=None,
+) -> pd.DataFrame:
+    """GMV/unidades/margen promedio por mecanica planeada vs. ejecutada,
+    ORIGEN_CAMPANA, Departamento, Categoria y tienda, para la ventana dada -
+    responde '¿gano SPON o 6x5?' y '¿se ejecuto lo que planeamos?' sin
+    mezclar lo nuestro con promos de otros equipos. Los filtros opcionales
+    acotan el WHERE; Departamento/Categoria/STORE_ID quedan en el
+    SELECT/GROUP BY como dimensiones de desglose, no solo de filtro.
+
+    Incluye traccion por categoria-tienda (rotacion.py): UNIDADES_DIA (real,
+    de esta fila) vs. HISTORICO_UNIDADES_DIA (ritmo normal real de esa
+    categoria-tienda) - TRACCION = cuantas veces por encima/debajo de su
+    ritmo normal vendio."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(departamento, categoria, store_id, origen)
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
     cur.execute(
         f"""
         SELECT
+            MECANICA_PLANEADA,
             MECANICA_EJECUTADA,
             ORIGEN_CAMPANA,
+            DEPARTAMENTO,
+            CATEGORIA,
+            STORE_ID,
             COUNT(DISTINCT SKU || '-' || STORE_ID) AS SKUS,
             SUM(UNIDADES) AS UNIDADES_TOTALES,
             SUM(GMV) AS GMV_TOTAL,
             AVG(MARGIN) AS MARGEN_PROMEDIO
         FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
-        WHERE FECHA BETWEEN %s AND %s
-        GROUP BY MECANICA_EJECUTADA, ORIGEN_CAMPANA
+        WHERE {where_clause}
+        GROUP BY MECANICA_PLANEADA, MECANICA_EJECUTADA, ORIGEN_CAMPANA, DEPARTAMENTO, CATEGORIA, STORE_ID
         ORDER BY GMV_TOTAL DESC
         """,
-        (campaign_start.date(), campaign_end.date()),
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
     )
     columnas = [c[0] for c in cur.description]
-    return pd.DataFrame(cur.fetchall(), columns=columnas)
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+
+    dias_ventana = (campaign_end - campaign_start).days + 1
+    df["UNIDADES_DIA"] = df["UNIDADES_TOTALES"] / dias_ventana
+
+    # UNIDADES_DIA de esta fila suma varios SKUs (ver columna SKUS) - hay
+    # que compararlo contra el total normal de TODA la categoria
+    # (UNIDADES_DIA_CATEGORIA_TOTAL, una suma), no contra el promedio de un
+    # solo SKU tipico (UNIDADES_DIA_CATEGORIA_BASELINE, usado en cambio por
+    # strategy.py para comparar SKUs individuales) - usar el promedio aqui
+    # comparaba "1 SKU" contra "N SKUs sumados" y disparaba tracciones
+    # absurdas (miles de x).
+    baseline = rotacion.get_baseline_categoria(cur)
+    baseline_cat = baseline.drop_duplicates(subset=["Categoria", "STORE_ID"])[
+        ["Categoria", "STORE_ID", "UNIDADES_DIA_CATEGORIA_TOTAL"]
+    ].rename(columns={"Categoria": "CATEGORIA", "UNIDADES_DIA_CATEGORIA_TOTAL": "HISTORICO_UNIDADES_DIA"})
+    df = df.merge(baseline_cat, on=["CATEGORIA", "STORE_ID"], how="left")
+    df["TRACCION"] = df["UNIDADES_DIA"] / df["HISTORICO_UNIDADES_DIA"]
+    return df.sort_values("GMV_TOTAL", ascending=False)
 
 
 def listar_campanas(cur) -> pd.DataFrame:
@@ -292,26 +368,77 @@ def listar_campanas(cur) -> pd.DataFrame:
     return pd.DataFrame(cur.fetchall(), columns=columnas)
 
 
-def resumen_adopcion(cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp) -> pd.DataFrame:
+def resumen_adopcion(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+) -> pd.DataFrame:
     """SKU-tienda distintos por ORIGEN_CAMPANA en la ventana, y de esos
-    cuantos tuvieron venta con promo real (CON_PROMO). Filtra por FECHA, NO
-    por CAMPAIGN_START/CAMPAIGN_END: esas dos columnas de
-    WKND_PLAN_VS_ACTUAL_V vienen solo del lado de WKND_PROMO_PLAN, y son
-    NULL para las filas que en el FULL OUTER JOIN solo existen del lado de
-    WKND_PROMO_RESULTS_V (es decir, 'Otra fuente' y 'Sin promo') - filtrar
-    por esas columnas dejaria esos dos buckets siempre vacios."""
+    cuantos tuvieron venta con promo real (CON_PROMO). Consulta
+    WKND_POSTMORTEM_PROMO_V (no WKND_PLAN_VS_ACTUAL_V directo) porque ahi ya
+    estan DEPARTAMENTO/CATEGORIA para poder filtrar. Filtra por FECHA, NO
+    por CAMPAIGN_START/CAMPAIGN_END: esas dos columnas vienen solo del lado
+    de WKND_PROMO_PLAN, y son NULL para las filas que en el FULL OUTER JOIN
+    original solo existen del lado de WKND_PROMO_RESULTS_V (es decir, 'Otra
+    fuente' y 'Sin promo') - filtrar por esas columnas dejaria esos dos
+    buckets siempre vacios."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(departamento, categoria, store_id)
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
     cur.execute(
         f"""
         SELECT
             ORIGEN_CAMPANA,
             COUNT(DISTINCT SKU || '-' || STORE_ID) AS SKU_TIENDAS,
             COUNT(DISTINCT CASE WHEN CON_PROMO THEN SKU || '-' || STORE_ID END) AS SKU_TIENDAS_CON_PROMO_REAL
-        FROM {SCHEMA}.WKND_PLAN_VS_ACTUAL_V
-        WHERE FECHA BETWEEN %s AND %s
+        FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
+        WHERE {where_clause}
         GROUP BY ORIGEN_CAMPANA
         ORDER BY SKU_TIENDAS DESC
         """,
-        (campaign_start.date(), campaign_end.date()),
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
+    )
+    columnas = [c[0] for c in cur.description]
+    return pd.DataFrame(cur.fetchall(), columns=columnas)
+
+
+def top_skus(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    n: int = 20,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+    origen=None,
+) -> pd.DataFrame:
+    """Ranking de SKUs mas vendidos (unidades) en la ventana, con
+    Departamento/Categoria/tienda/mecanica/origen y filtros opcionales sobre
+    esas mismas dimensiones. No hay nombre de producto disponible en los
+    objetos de Snowflake usados aqui (FULL_MASTER_CATALOG solo trae
+    SKU/DEPARTMENT/CATEGORY) - el ranking muestra el codigo de SKU crudo."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(departamento, categoria, store_id, origen)
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
+    cur.execute(
+        f"""
+        SELECT
+            SKU,
+            STORE_ID,
+            DEPARTAMENTO,
+            CATEGORIA,
+            MECANICA_EJECUTADA,
+            ORIGEN_CAMPANA,
+            SUM(UNIDADES) AS UNIDADES_TOTALES,
+            SUM(GMV) AS GMV_TOTAL
+        FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
+        WHERE {where_clause}
+        GROUP BY SKU, STORE_ID, DEPARTAMENTO, CATEGORIA, MECANICA_EJECUTADA, ORIGEN_CAMPANA
+        ORDER BY UNIDADES_TOTALES DESC
+        LIMIT {int(n)}
+        """,
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
     )
     columnas = [c[0] for c in cur.description]
     return pd.DataFrame(cur.fetchall(), columns=columnas)

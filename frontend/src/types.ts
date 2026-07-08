@@ -16,12 +16,19 @@ export interface AdoptionSummary {
 }
 
 export interface MechanicRow {
+  MECANICA_PLANEADA: string | null
   MECANICA_EJECUTADA: string | null
   ORIGEN_CAMPANA: string
+  DEPARTAMENTO: string | null
+  CATEGORIA: string | null
+  STORE_ID: number
   SKUS: number
   UNIDADES_TOTALES: number | null
   GMV_TOTAL: number | null
   MARGEN_PROMEDIO: number | null
+  UNIDADES_DIA: number | null
+  HISTORICO_UNIDADES_DIA: number | null
+  TRACCION: number | null
 }
 
 export interface RedemptionRow {
@@ -34,4 +41,34 @@ export interface RedemptionRow {
   REDENCION_REAL: number | null
   REDENCION_SUPUESTA: number | null
   DIFERENCIA: number | null
+}
+
+export interface TopSkuRow {
+  SKU: number
+  STORE_ID: number
+  DEPARTAMENTO: string | null
+  CATEGORIA: string | null
+  MECANICA_EJECUTADA: string | null
+  ORIGEN_CAMPANA: string
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+}
+
+export interface StoreOption {
+  id: number
+  nombre: string
+}
+
+export interface Filters {
+  departamentos: string[]
+  categorias: string[]
+  stores: StoreOption[]
+  origenes: string[]
+}
+
+export interface CampaignFilters {
+  departamento?: string
+  categoria?: string
+  store_id?: number
+  origen?: string
 }
