@@ -6,6 +6,11 @@ interface Props {
   onChange: (f: CampaignFilters) => void
 }
 
+const ADOPCION_LABELS: Record<string, string> = {
+  con_mecanica: 'Con mecanica (adoptado)',
+  sin_mecanica: 'Sin mecanica (no adoptado)',
+}
+
 export default function FilterBar({ filters, value, onChange }: Props) {
   return (
     <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', margin: '0.75rem 0' }}>
@@ -53,6 +58,18 @@ export default function FilterBar({ filters, value, onChange }: Props) {
         {filters.origenes.map((o) => (
           <option key={o} value={o}>
             {o}
+          </option>
+        ))}
+      </select>
+
+      <select
+        value={value.adopcion ?? ''}
+        onChange={(e) => onChange({ ...value, adopcion: e.target.value || undefined })}
+      >
+        <option value="">Con o sin mecanica</option>
+        {filters.adopciones.map((a) => (
+          <option key={a} value={a}>
+            {ADOPCION_LABELS[a] ?? a}
           </option>
         ))}
       </select>

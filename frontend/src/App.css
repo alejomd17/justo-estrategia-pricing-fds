@@ -53,3 +53,7 @@ button:not(:disabled) {
 button:disabled {
   opacity: 0.5;
 }
+
+.bar-fill:hover {
+  filter: brightness(1.15);
+}

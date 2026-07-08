@@ -15,13 +15,19 @@ import KpiCards from './components/KpiCards'
 import MechanicsTable from './components/MechanicsTable'
 import RedemptionTable from './components/RedemptionTable'
 import TopSkusTable from './components/TopSkusTable'
+import TopChartsSection from './components/TopChartsSection'
 import './App.css'
 
 function App() {
   const [campaigns, setCampaigns] = useState<Campaign[]>([])
   const [selected, setSelected] = useState<Campaign | null>(null)
   const [filters, setFilters] = useState<Filters | null>(null)
-  const [campaignFilters, setCampaignFilters] = useState<CampaignFilters>({})
+  // Por defecto solo lo nuestro (WKND) y lo que si se ejecuto (con_mecanica) -
+  // el usuario puede volver a "Todos" desde el FilterBar si quiere ver todo.
+  const [campaignFilters, setCampaignFilters] = useState<CampaignFilters>({
+    origen: 'WKND',
+    adopcion: 'con_mecanica',
+  })
   const [summary, setSummary] = useState<AdoptionSummary | null>(null)
   const [mechanics, setMechanics] = useState<MechanicRow[]>([])
   const [redemption, setRedemption] = useState<RedemptionRow[]>([])
@@ -92,7 +98,7 @@ function App() {
   }, [selected, campaignFilters])
 
   return (
-    <div style={{ padding: '2rem', maxWidth: '1100px', margin: '0 auto' }}>
+    <div style={{ padding: '2rem', maxWidth: '1800px', margin: '0 auto' }}>
       <h1>Post-mortem de promos FDS</h1>
 
       {campaigns.length === 0 && !error && <p>Cargando campanas...</p>}
@@ -111,7 +117,7 @@ function App() {
         {summary && (
           <section style={{ marginTop: '1.5rem' }}>
             <h2>Resumen</h2>
-            <KpiCards summary={summary} />
+            <KpiCards summary={summary} mechanics={mechanics} />
           </section>
         )}
 
@@ -119,6 +125,13 @@ function App() {
           <section style={{ marginTop: '1.5rem' }}>
             <h2>Performance FDS</h2>
             <MechanicsTable rows={mechanics} />
+          </section>
+        )}
+
+        {mechanics.length > 0 && (
+          <section style={{ marginTop: '1.5rem' }}>
+            <h2>Tops de la campana</h2>
+            <TopChartsSection rows={mechanics} />
           </section>
         )}
 

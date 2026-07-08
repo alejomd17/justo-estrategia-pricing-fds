@@ -29,6 +29,7 @@ def filters(cur=Depends(get_cursor)):
         "categorias": sorted(depcat["Categoria"].dropna().unique().tolist()),
         "stores": [{"id": store_id, "nombre": nombre} for store_id, nombre in STORE_NAMES.items()],
         "origenes": ORIGENES_CAMPANA,
+        "adopciones": ["con_mecanica", "sin_mecanica"],
     }
 
 
@@ -68,10 +69,11 @@ def campaign_mechanics(
     categoria: Optional[str] = None,
     store_id: Optional[int] = None,
     origen: Optional[str] = None,
+    adopcion: Optional[str] = None,
     cur=Depends(get_cursor),
 ):
     df = postmortem.performance_por_mecanica(
-        cur, pd.Timestamp(campaign_start), pd.Timestamp(campaign_end), departamento, categoria, store_id, origen
+        cur, pd.Timestamp(campaign_start), pd.Timestamp(campaign_end), departamento, categoria, store_id, origen, adopcion
     )
     return df_to_records(df)
 
@@ -91,9 +93,10 @@ def campaign_top_skus(
     categoria: Optional[str] = None,
     store_id: Optional[int] = None,
     origen: Optional[str] = None,
+    adopcion: Optional[str] = None,
     cur=Depends(get_cursor),
 ):
     df = postmortem.top_skus(
-        cur, pd.Timestamp(campaign_start), pd.Timestamp(campaign_end), n, departamento, categoria, store_id, origen
+        cur, pd.Timestamp(campaign_start), pd.Timestamp(campaign_end), n, departamento, categoria, store_id, origen, adopcion
     )
     return df_to_records(df)

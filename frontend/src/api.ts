@@ -23,6 +23,7 @@ function toQueryString(filters: CampaignFilters): string {
   if (filters.categoria) params.set('categoria', filters.categoria)
   if (filters.store_id) params.set('store_id', String(filters.store_id))
   if (filters.origen) params.set('origen', filters.origen)
+  if (filters.adopcion) params.set('adopcion', filters.adopcion)
   const qs = params.toString()
   return qs ? `?${qs}` : ''
 }

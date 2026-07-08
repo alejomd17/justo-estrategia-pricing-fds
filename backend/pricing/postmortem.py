@@ -10,13 +10,9 @@ MX_JUSTO_PROD.SANDBOX definidos en el plan (ver
 - WKND_POSTMORTEM_PROMO_V (VIEW): insights agregados (performance por mecanica,
   top ganadores/perdedores, oportunidades de subir precio).
 
-IMPORTANTE: este modulo esta escrito a partir de las columnas ya conocidas
-de DISCOUNT_CAMPAIGN_EVENT/MASTER_ORDERLINE/VW_PRICING_DASHBOARD, pero NO se
-ha podido probar contra Snowflake real (requiere SSO interactivo). Antes de
-confiar en el, correr la Fase 0 del plan (chequeo de FACT_FULFILLMENT_LINE y
-confirmar que las promos del FDS ya estan cargadas) y validar cada CREATE
-VIEW con un SELECT de sanity check, tal como dice la seccion de
-Verificacion del plan.
+COST/MARGIN/FINAL_PRICE se traen de PRICE_JUSTO_MS_HISTORY (ver
+crear_postmortem_promo_v) - no de VW_PRICING_DASHBOARD, que no daba
+confianza en el costo.
 """
 
 import pandas as pd
@@ -64,6 +60,17 @@ def crear_fds_promo_results_v(cur) -> None:
     Lo que no encaja en esa taxonomia NO se agrupa como "Otro" - se deja el
     valor real de BY_BULK_STRATEGY_DISCOUNT_TYPE tal cual, para poder ver
     que mecanica es de verdad en vez de un cajon generico.
+
+    IMPORTANTE: un SKU+tienda+dia puede tener varias campanas de
+    DISCOUNT_CAMPAIGN_EVENT traslapando esas fechas (confirmado: 44,148 filas
+    cruzan la ventana del FDS 3-5 jul para tiendas 9/14 - la mayoria son
+    campanas comerciales de largo aliento que solo pasan de paso por esas
+    fechas). Sin dedup, el LEFT JOIN por rango de fechas multiplica la misma
+    venta real una vez por cada campana que hace match (se detecto en vivo:
+    SKU 18756 mostraba 2,898 unidades en el dashboard cuando la venta real
+    era 8-9). El QUALIFY se queda con una sola campana por SKU+tienda+dia,
+    prefiriendo una mecanica reconocida sobre 'Sin dato' y, entre esas, la de
+    ventana mas angosta (mas especifica que una campana comercial generica).
     """
     cur.execute(f"""
         CREATE OR REPLACE VIEW {SCHEMA}.WKND_PROMO_RESULTS_V AS
@@ -123,6 +130,13 @@ def crear_fds_promo_results_v(cur) -> None:
             ON v.SKU = c.SKU
            AND v.STORE_ID = c.STORE_ID
            AND v.FECHA BETWEEN c.START_DATE AND c.END_DATE
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY v.SKU, v.STORE_ID, v.FECHA
+            ORDER BY
+                CASE WHEN c.MECANICA = 'Sin dato' THEN 1 ELSE 0 END,
+                DATEDIFF(day, c.START_DATE, c.END_DATE) ASC,
+                c.START_DATE DESC
+        ) = 1
     """)
 
 
@@ -234,12 +248,55 @@ def crear_fds_plan_vs_actual_v(cur) -> None:
 
 def crear_postmortem_promo_v(cur) -> None:
     """Insights agregados sobre WKND_PLAN_VS_ACTUAL_V (hereda ORIGEN_CAMPANA)
-    + VW_PRICING_DASHBOARD para margen/costo real + FULL_MASTER_CATALOG para
-    Departamento/Categoria (Fase 5 - filtros del dashboard y traccion por
-    categoria). No se ignoran PROMO_ACTIVA/30-dias de VW_PRICING_DASHBOARD
-    porque no se seleccionan aqui."""
+    + FULL_MASTER_CATALOG para Departamento/Categoria (Fase 5 - filtros del
+    dashboard y traccion por categoria).
+
+    COST/MARGIN/FINAL_PRICE ya NO vienen de VW_PRICING_DASHBOARD (no daba
+    confianza en el costo - Data/Finance lo confirmo). En su lugar, el CTE
+    `precio_costo_activo` trae el precio/costo vigente directo de
+    PRICE_JUSTO_MS_HISTORY: solo catalogo activo+publicado (via
+    CURRENT_PRODUCT_CATALOG_WITH_CATEGORY, tiendas AT=9/CO=14), deduplicado
+    a la fila mas reciente por PRODUCT_ID+STORE_ID+BRAND+SEGMENT_ID+
+    SUBCATEGORY_ID+CATEGORY_ID+DEPARTMENT_ID (ORDER BY LOADED_LAKED_DATE
+    DESC, NEXT_CREATED_AT DESC), acotado a SEGMENT_ID='default' y
+    BRAND='justo' (query provista por Data/Finance)."""
     cur.execute(f"""
         CREATE OR REPLACE VIEW {SCHEMA}.WKND_POSTMORTEM_PROMO_V AS
+        WITH catalogo_activo AS (
+            SELECT DISTINCT
+                p.PRODUCT_ID,
+                CASE
+                    WHEN wh.value::STRING = 'AT' THEN 9
+                    WHEN wh.value::STRING = 'CO' THEN 14
+                END AS STORE_ID
+            FROM MX_JUSTO_PROD.ODS_MS_PRODUCT_V.CURRENT_PRODUCT_CATALOG_WITH_CATEGORY p,
+                 LATERAL FLATTEN(input => p.ACTIVE_WAREHOUSES) wh
+            WHERE p.is_active = TRUE
+              AND p.is_published = TRUE
+              AND wh.value::STRING IN ('AT', 'CO')
+        ),
+        precio_costo_activo AS (
+            SELECT
+                h.PRODUCT_ID AS SKU,
+                h.STORE_ID,
+                h.COST,
+                h.MARGIN,
+                h.FINAL_PRICE,
+                ROW_NUMBER() OVER (
+                    PARTITION BY
+                        h.PRODUCT_ID, h.STORE_ID, h.BRAND, h.SEGMENT_ID,
+                        h.SUBCATEGORY_ID, h.CATEGORY_ID, h.DEPARTMENT_ID
+                    ORDER BY h.LOADED_LAKED_DATE DESC, h.NEXT_CREATED_AT DESC
+                ) AS rn
+            FROM MX_JUSTO_PROD.DA_PRICING.PRICE_JUSTO_MS_HISTORY h
+            INNER JOIN catalogo_activo ca
+                ON h.PRODUCT_ID = ca.PRODUCT_ID
+               AND h.STORE_ID = ca.STORE_ID
+            WHERE h.STORE_ID IN (9, 14)
+              AND h.SEGMENT_ID = 'default'
+              AND h.BRAND = 'justo'
+            QUALIFY rn = 1
+        )
         SELECT
             pva.SKU,
             pva.STORE_ID,
@@ -260,19 +317,22 @@ def crear_postmortem_promo_v(cur) -> None:
             fmc.DEPARTMENT AS DEPARTAMENTO,
             fmc.CATEGORY   AS CATEGORIA
         FROM {SCHEMA}.WKND_PLAN_VS_ACTUAL_V pva
-        LEFT JOIN {SCHEMA}.VW_PRICING_DASHBOARD vpd
-            ON pva.SKU = vpd.SKU
+        LEFT JOIN precio_costo_activo vpd
+            ON TRY_TO_NUMBER(pva.SKU::VARCHAR) = TRY_TO_NUMBER(vpd.SKU::VARCHAR)
            AND pva.STORE_ID = vpd.STORE_ID
         LEFT JOIN {SCHEMA}.FULL_MASTER_CATALOG fmc
             ON TRY_TO_NUMBER(pva.SKU::VARCHAR) = TRY_TO_NUMBER(fmc.SKU::VARCHAR)
     """)
 
 
-def _filtros_departamento_categoria_tienda(departamento=None, categoria=None, store_id=None, origen=None):
+def _filtros_departamento_categoria_tienda(departamento=None, categoria=None, store_id=None, origen=None, adopcion=None):
     """Cláusulas/params opcionales compartidas por performance_por_mecanica,
     resumen_adopcion y top_skus - mismo patrón de condición armada en Python
     que ya usa catalog.get_pricing_dashboard con su parametro `skus`.
-    `origen` filtra por ORIGEN_CAMPANA ('WKND' / 'Otra fuente' / 'Sin promo')."""
+    `origen` filtra por ORIGEN_CAMPANA ('WKND' / 'Otra fuente' / 'Sin promo').
+    `adopcion` filtra por si hubo mecanica real cargada o no ('con_mecanica'
+    / 'sin_mecanica') - responde 'lo propusimos en WKND pero, ¿lo
+    adoptaron?'."""
     condiciones = []
     params = []
     if departamento:
@@ -287,6 +347,10 @@ def _filtros_departamento_categoria_tienda(departamento=None, categoria=None, st
     if origen:
         condiciones.append("ORIGEN_CAMPANA = %s")
         params.append(origen)
+    if adopcion == "con_mecanica":
+        condiciones.append("MECANICA_EJECUTADA IS NOT NULL")
+    elif adopcion == "sin_mecanica":
+        condiciones.append("MECANICA_EJECUTADA IS NULL")
     return condiciones, params
 
 
@@ -298,6 +362,7 @@ def performance_por_mecanica(
     categoria=None,
     store_id=None,
     origen=None,
+    adopcion=None,
 ) -> pd.DataFrame:
     """GMV/unidades/margen promedio por mecanica planeada vs. ejecutada,
     ORIGEN_CAMPANA, Departamento, Categoria y tienda, para la ventana dada -
@@ -306,53 +371,149 @@ def performance_por_mecanica(
     acotan el WHERE; Departamento/Categoria/STORE_ID quedan en el
     SELECT/GROUP BY como dimensiones de desglose, no solo de filtro.
 
-    Incluye traccion por categoria-tienda (rotacion.py): UNIDADES_DIA (real,
-    de esta fila) vs. HISTORICO_UNIDADES_DIA (ritmo normal real de esa
-    categoria-tienda) - TRACCION = cuantas veces por encima/debajo de su
-    ritmo normal vendio."""
-    condiciones, params_filtro = _filtros_departamento_categoria_tienda(departamento, categoria, store_id, origen)
+    Incluye DOS versiones de traccion (rotacion.py), no intercambiables -
+    ambas se calculan aqui, pero el frontend (MechanicsTable) solo muestra
+    TRACCION_SKUS; HISTORICO_UNIDADES_DIA_CATEGORIA/TRACCION_CATEGORIA
+    quedan disponibles en la API para quien las necesite:
+    - TRACCION_SKUS: UNIDADES_DIA (real, de esta fila) vs. el historico de
+      SOLO los SKUs que participan en esta fila, sumado - "¿estos SKUs
+      especificos vendieron mas de lo normal?". Evita el sesgo de comparar
+      pocos SKUs promovidos contra una categoria de 100+ SKUs.
+    - TRACCION_CATEGORIA: UNIDADES_DIA vs. el historico de TODA la
+      categoria-tienda, sumado - "¿la categoria completa crecio?", aunque
+      solo hayamos tocado una fraccion de sus SKUs.
+
+    INGRESO_SUPUESTO_SIN_PROMO / GANANCIA_POR_ESTRATEGIA: la resta simulada
+    para saber cuanto genero la estrategia en plata. Por SKU: precio
+    promedio (FINAL_PRICE, ver crear_postmortem_promo_v - viene de
+    PRICE_JUSTO_MS_HISTORY, catalogo activo/publicado, mas confiable que
+    VW_PRICING_DASHBOARD o FACT_FULFILLMENT_LINE) x su ritmo historico de
+    unidades/dia x los dias de la ventana = cuanto hubiera facturado ese SKU
+    sin promo, a su ritmo normal. GANANCIA_POR_ESTRATEGIA = GMV_TOTAL real -
+    ese supuesto. CAVEAT: es el precio VIGENTE mas reciente (la fila mas
+    nueva de PRICE_JUSTO_MS_HISTORY), no necesariamente el precio regular
+    exacto del 3-5 jul si hubo un cambio de precio despues - proxy
+    razonable, pero no historico exacto.
+
+    El filtro `adopcion` se aplica DESPUES de colapsar por SKU (ver
+    `llave_sku` abajo), no en el WHERE de la query: MECANICA_EJECUTADA puede
+    variar dia a dia para un mismo SKU (ej. el evento real de
+    DISCOUNT_CAMPAIGN_EVENT se cargo un dia despues del inicio de la
+    ventana), y GROUP BY MECANICA_EJECUTADA fragmenta ese SKU en varias
+    filas SQL - una por dia/mecanica distinta. Filtrar por adopcion en el
+    WHERE descartaba los dias sin mecanica pero dejaba los dias CON mecanica
+    sueltos, mostrando solo una fraccion de las unidades reales del fin de
+    semana de ese SKU (se detecto en vivo: SKU 23827 mostraba 258 unidades
+    en el dashboard cuando el fin de semana completo sumaba 258+149+lo del
+    domingo)."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id, origen, adopcion=None
+    )
     where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
     cur.execute(
         f"""
         SELECT
+            SKU,
+            STORE_ID,
             MECANICA_PLANEADA,
             MECANICA_EJECUTADA,
             ORIGEN_CAMPANA,
             DEPARTAMENTO,
             CATEGORIA,
-            STORE_ID,
-            COUNT(DISTINCT SKU || '-' || STORE_ID) AS SKUS,
             SUM(UNIDADES) AS UNIDADES_TOTALES,
             SUM(GMV) AS GMV_TOTAL,
-            AVG(MARGIN) AS MARGEN_PROMEDIO
+            AVG(MARGIN) AS MARGEN_PROMEDIO,
+            AVG(FINAL_PRICE) AS PRECIO_PROMEDIO
         FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
         WHERE {where_clause}
-        GROUP BY MECANICA_PLANEADA, MECANICA_EJECUTADA, ORIGEN_CAMPANA, DEPARTAMENTO, CATEGORIA, STORE_ID
-        ORDER BY GMV_TOTAL DESC
+        GROUP BY SKU, STORE_ID, MECANICA_PLANEADA, MECANICA_EJECUTADA, ORIGEN_CAMPANA, DEPARTAMENTO, CATEGORIA
         """,
         [campaign_start.date(), campaign_end.date()] + params_filtro,
     )
     columnas = [c[0] for c in cur.description]
-    df = pd.DataFrame(cur.fetchall(), columns=columnas)
-    if df.empty:
-        return df
+    detalle = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if detalle.empty:
+        return detalle
+
+    detalle["SKU"] = pd.to_numeric(detalle["SKU"], errors="coerce")
+    detalle = detalle.dropna(subset=["SKU"])
+    detalle["SKU"] = detalle["SKU"].astype(int)
+    detalle["STORE_ID"] = detalle["STORE_ID"].astype(int)
+    # AVG(...) de Snowflake vuelve como decimal.Decimal, no float - sin este
+    # cast, PRECIO_PROMEDIO * UNIDADES_DIA_SKU_TIENDA (float64) revienta con
+    # TypeError (Decimal no opera con float directamente).
+    detalle["PRECIO_PROMEDIO"] = detalle["PRECIO_PROMEDIO"].astype(float)
+    detalle["MARGEN_PROMEDIO"] = detalle["MARGEN_PROMEDIO"].astype(float)
+
+    # Colapsar a UNA fila por SKU+tienda: sumar unidades/GMV de TODOS sus
+    # fragmentos (con y sin mecanica ejecutada) y quedarse con la mecanica
+    # ejecutada dominante: prioriza CUALQUIER mecanica real sobre "sin
+    # mecanica" (si un dia tuvo mecanica y otros no, mostrar la real, no la
+    # que junto mas unidades a secas - si no, un SKU con 1 dia de mecanica y
+    # 2 dias de venta organica normal mostraba "Sin mecanica" pese a pasar
+    # el filtro de adopcion "con_mecanica", una contradiccion). Entre
+    # mecanicas reales de distintos dias, se desempata por unidades.
+    # TUVO_MECANICA marca si ALGUN dia tuvo mecanica real - eso es lo que
+    # decide el filtro de adopcion, sin descartar unidades de los otros
+    # dias de ese mismo SKU.
+    llave_sku = ["SKU", "STORE_ID", "MECANICA_PLANEADA", "ORIGEN_CAMPANA", "DEPARTAMENTO", "CATEGORIA"]
+    detalle["TUVO_MECANICA"] = detalle["MECANICA_EJECUTADA"].notna()
+    dominante = (
+        detalle.sort_values(["TUVO_MECANICA", "UNIDADES_TOTALES"], ascending=[False, False])
+        .drop_duplicates(subset=llave_sku, keep="first")[llave_sku + ["MECANICA_EJECUTADA"]]
+    )
+    detalle_sku = (
+        detalle.groupby(llave_sku, dropna=False)
+        .agg(
+            UNIDADES_TOTALES=("UNIDADES_TOTALES", "sum"),
+            GMV_TOTAL=("GMV_TOTAL", "sum"),
+            MARGEN_PROMEDIO=("MARGEN_PROMEDIO", "mean"),
+            PRECIO_PROMEDIO=("PRECIO_PROMEDIO", "mean"),
+            TUVO_MECANICA=("TUVO_MECANICA", "any"),
+        )
+        .reset_index()
+        .merge(dominante, on=llave_sku, how="left")
+    )
+
+    if adopcion == "con_mecanica":
+        detalle_sku = detalle_sku[detalle_sku["TUVO_MECANICA"]]
+    elif adopcion == "sin_mecanica":
+        detalle_sku = detalle_sku[~detalle_sku["TUVO_MECANICA"]]
+    if detalle_sku.empty:
+        return detalle_sku
+
+    baseline = rotacion.get_baseline_categoria(cur)
+    baseline_sku = baseline[["SKU", "STORE_ID", "UNIDADES_DIA_SKU_TIENDA"]]
+    detalle_sku = detalle_sku.merge(baseline_sku, on=["SKU", "STORE_ID"], how="left")
 
     dias_ventana = (campaign_end - campaign_start).days + 1
-    df["UNIDADES_DIA"] = df["UNIDADES_TOTALES"] / dias_ventana
+    detalle_sku["INGRESO_SUPUESTO_SIN_PROMO"] = (
+        detalle_sku["PRECIO_PROMEDIO"] * detalle_sku["UNIDADES_DIA_SKU_TIENDA"] * dias_ventana
+    )
 
-    # UNIDADES_DIA de esta fila suma varios SKUs (ver columna SKUS) - hay
-    # que compararlo contra el total normal de TODA la categoria
-    # (UNIDADES_DIA_CATEGORIA_TOTAL, una suma), no contra el promedio de un
-    # solo SKU tipico (UNIDADES_DIA_CATEGORIA_BASELINE, usado en cambio por
-    # strategy.py para comparar SKUs individuales) - usar el promedio aqui
-    # comparaba "1 SKU" contra "N SKUs sumados" y disparaba tracciones
-    # absurdas (miles de x).
-    baseline = rotacion.get_baseline_categoria(cur)
+    grupo = ["MECANICA_PLANEADA", "MECANICA_EJECUTADA", "ORIGEN_CAMPANA", "DEPARTAMENTO", "CATEGORIA", "STORE_ID"]
+    df = (
+        detalle_sku.groupby(grupo, dropna=False)
+        .agg(
+            SKUS=("SKU", "nunique"),
+            UNIDADES_TOTALES=("UNIDADES_TOTALES", "sum"),
+            GMV_TOTAL=("GMV_TOTAL", "sum"),
+            MARGEN_PROMEDIO=("MARGEN_PROMEDIO", "mean"),
+            HISTORICO_UNIDADES_DIA_SKUS=("UNIDADES_DIA_SKU_TIENDA", "sum"),
+            INGRESO_SUPUESTO_SIN_PROMO=("INGRESO_SUPUESTO_SIN_PROMO", "sum"),
+        )
+        .reset_index()
+    )
+
     baseline_cat = baseline.drop_duplicates(subset=["Categoria", "STORE_ID"])[
         ["Categoria", "STORE_ID", "UNIDADES_DIA_CATEGORIA_TOTAL"]
-    ].rename(columns={"Categoria": "CATEGORIA", "UNIDADES_DIA_CATEGORIA_TOTAL": "HISTORICO_UNIDADES_DIA"})
+    ].rename(columns={"Categoria": "CATEGORIA", "UNIDADES_DIA_CATEGORIA_TOTAL": "HISTORICO_UNIDADES_DIA_CATEGORIA"})
     df = df.merge(baseline_cat, on=["CATEGORIA", "STORE_ID"], how="left")
-    df["TRACCION"] = df["UNIDADES_DIA"] / df["HISTORICO_UNIDADES_DIA"]
+
+    df["UNIDADES_DIA"] = df["UNIDADES_TOTALES"] / dias_ventana
+    df["TRACCION_SKUS"] = df["UNIDADES_DIA"] / df["HISTORICO_UNIDADES_DIA_SKUS"]
+    df["TRACCION_CATEGORIA"] = df["UNIDADES_DIA"] / df["HISTORICO_UNIDADES_DIA_CATEGORIA"]
+    df["GANANCIA_POR_ESTRATEGIA"] = df["GMV_TOTAL"] - df["INGRESO_SUPUESTO_SIN_PROMO"]
     return df.sort_values("GMV_TOTAL", ascending=False)
 
 
@@ -413,13 +574,22 @@ def top_skus(
     categoria=None,
     store_id=None,
     origen=None,
+    adopcion=None,
 ) -> pd.DataFrame:
     """Ranking de SKUs mas vendidos (unidades) en la ventana, con
     Departamento/Categoria/tienda/mecanica/origen y filtros opcionales sobre
     esas mismas dimensiones. No hay nombre de producto disponible en los
     objetos de Snowflake usados aqui (FULL_MASTER_CATALOG solo trae
-    SKU/DEPARTMENT/CATEGORY) - el ranking muestra el codigo de SKU crudo."""
-    condiciones, params_filtro = _filtros_departamento_categoria_tienda(departamento, categoria, store_id, origen)
+    SKU/DEPARTMENT/CATEGORY) - el ranking muestra el codigo de SKU crudo.
+
+    Igual que performance_por_mecanica: MECANICA_EJECUTADA puede variar dia
+    a dia para un mismo SKU, asi que se colapsa a UNA fila por SKU+tienda
+    ANTES de rankear/filtrar por adopcion - de lo contrario el ORDER BY +
+    LIMIT de SQL rankeaba fragmentos sueltos (una fraccion de las unidades
+    reales de cada SKU), no el total del fin de semana."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id, origen, adopcion=None
+    )
     where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
     cur.execute(
         f"""
@@ -435,13 +605,39 @@ def top_skus(
         FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
         WHERE {where_clause}
         GROUP BY SKU, STORE_ID, DEPARTAMENTO, CATEGORIA, MECANICA_EJECUTADA, ORIGEN_CAMPANA
-        ORDER BY UNIDADES_TOTALES DESC
-        LIMIT {int(n)}
         """,
         [campaign_start.date(), campaign_end.date()] + params_filtro,
     )
     columnas = [c[0] for c in cur.description]
-    return pd.DataFrame(cur.fetchall(), columns=columnas)
+    detalle = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if detalle.empty:
+        return detalle
+
+    llave_sku = ["SKU", "STORE_ID", "DEPARTAMENTO", "CATEGORIA", "ORIGEN_CAMPANA"]
+    detalle["TUVO_MECANICA"] = detalle["MECANICA_EJECUTADA"].notna()
+    # Prioriza cualquier mecanica real sobre "sin mecanica" - ver la nota en
+    # performance_por_mecanica.
+    dominante = (
+        detalle.sort_values(["TUVO_MECANICA", "UNIDADES_TOTALES"], ascending=[False, False])
+        .drop_duplicates(subset=llave_sku, keep="first")[llave_sku + ["MECANICA_EJECUTADA"]]
+    )
+    df = (
+        detalle.groupby(llave_sku, dropna=False)
+        .agg(
+            UNIDADES_TOTALES=("UNIDADES_TOTALES", "sum"),
+            GMV_TOTAL=("GMV_TOTAL", "sum"),
+            TUVO_MECANICA=("TUVO_MECANICA", "any"),
+        )
+        .reset_index()
+        .merge(dominante, on=llave_sku, how="left")
+    )
+
+    if adopcion == "con_mecanica":
+        df = df[df["TUVO_MECANICA"]]
+    elif adopcion == "sin_mecanica":
+        df = df[~df["TUVO_MECANICA"]]
+
+    return df.sort_values("UNIDADES_TOTALES", ascending=False).head(n).drop(columns="TUVO_MECANICA")
 
 
 def contar_plan(cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp) -> int:

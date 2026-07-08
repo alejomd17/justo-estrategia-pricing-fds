@@ -38,8 +38,22 @@ const columns: Column<MechanicRow>[] = [
     render: (r) => (r.MARGEN_PROMEDIO != null ? `${r.MARGEN_PROMEDIO.toFixed(1)}%` : 'N/D'),
   },
   { key: 'UNIDADES_DIA', label: 'Unidades/dia', render: (r) => numero(r.UNIDADES_DIA) },
-  { key: 'HISTORICO_UNIDADES_DIA', label: 'Historico unidades/dia', render: (r) => numeroCeil(r.HISTORICO_UNIDADES_DIA) },
-  { key: 'TRACCION', label: 'Traccion', render: (r) => ratio(r.TRACCION) },
+  {
+    key: 'HISTORICO_UNIDADES_DIA_SKUS',
+    label: 'Historico (estos SKUs)',
+    render: (r) => numeroCeil(r.HISTORICO_UNIDADES_DIA_SKUS),
+  },
+  { key: 'TRACCION_SKUS', label: 'Traccion', render: (r) => ratio(r.TRACCION_SKUS) },
+  {
+    key: 'INGRESO_SUPUESTO_SIN_PROMO',
+    label: 'Ingreso supuesto sin promo',
+    render: (r) => (r.INGRESO_SUPUESTO_SIN_PROMO != null ? `$${numero(r.INGRESO_SUPUESTO_SIN_PROMO)}` : 'N/D'),
+  },
+  {
+    key: 'GANANCIA_POR_ESTRATEGIA',
+    label: 'Ganancia por estrategia',
+    render: (r) => (r.GANANCIA_POR_ESTRATEGIA != null ? `$${numero(r.GANANCIA_POR_ESTRATEGIA)}` : 'N/D'),
+  },
 ]
 
 export default function MechanicsTable({ rows }: Props) {
@@ -47,9 +61,12 @@ export default function MechanicsTable({ rows }: Props) {
     <div>
       <DataTable columns={columns} rows={rows} pageSize={10} />
       <p style={{ fontSize: '0.85rem', opacity: 0.7, marginTop: '0.5rem' }}>
-        Traccion = unidades/dia de esta fila, divididas entre el ritmo normal real de esa
-        categoria-bodega (historico, no el TAG_ROTACION estatico). Mayor a 1x = vendio por encima
-        de su ritmo habitual.
+        Traccion = unidades/dia de esta fila vs. el historico de SOLO los SKUs que participan
+        aqui, sumado - responde si esos SKUs especificos crecieron. Mayor a 1x = vendio por
+        encima de su ritmo habitual. Ingreso supuesto sin promo = precio promedio x ritmo
+        historico de unidades/dia x dias de la ventana - cuanto hubiera facturado sin promo, a su
+        ritmo normal (precio actual de catalogo, no necesariamente el vigente el fin de semana).
+        Ganancia por estrategia = GMV real - ese supuesto.
       </p>
     </div>
   )

@@ -1,10 +1,25 @@
-import type { AdoptionSummary } from '../types'
+import type { AdoptionSummary, MechanicRow } from '../types'
 
 interface Props {
   summary: AdoptionSummary
+  mechanics: MechanicRow[]
 }
 
-export default function KpiCards({ summary }: Props) {
+function sumaGanancia(rows: MechanicRow[]): number | null {
+  const valores = rows.map((r) => r.GANANCIA_POR_ESTRATEGIA).filter((v): v is number => v != null)
+  if (valores.length === 0) return null
+  return valores.reduce((acc, v) => acc + v, 0)
+}
+
+function promedioTraccion(rows: MechanicRow[]): number | null {
+  const valores = rows.map((r) => r.TRACCION_SKUS).filter((v): v is number => v != null && Number.isFinite(v))
+  if (valores.length === 0) return null
+  return valores.reduce((acc, v) => acc + v, 0) / valores.length
+}
+
+export default function KpiCards({ summary, mechanics }: Props) {
+  const ganancia = sumaGanancia(mechanics)
+  const traccion = promedioTraccion(mechanics)
   return (
     <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
       <div className="kpi-card">
@@ -16,6 +31,16 @@ export default function KpiCards({ summary }: Props) {
         <div className="kpi-value">
           {summary.adopcion_pct === null ? 'N/D' : `${summary.adopcion_pct}%`}
         </div>
+      </div>
+      <div className="kpi-card">
+        <div className="kpi-label">Ganancia por estrategia</div>
+        <div className="kpi-value">
+          {ganancia == null ? 'N/D' : `$${ganancia.toLocaleString('es-MX', { maximumFractionDigits: 0 })}`}
+        </div>
+      </div>
+      <div className="kpi-card">
+        <div className="kpi-label">Traccion promedio</div>
+        <div className="kpi-value">{traccion == null ? 'N/D' : `${traccion.toFixed(2)}x`}</div>
       </div>
       {summary.por_origen.map((row) => (
         <div className="kpi-card" key={row.ORIGEN_CAMPANA}>

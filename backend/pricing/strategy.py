@@ -700,6 +700,8 @@ def construir_estrategia(
 
     athenea = elasticity.get_athenea(cur)
     df = df.merge(athenea, on=["SKU", "STORE_ID"], how="left")
+    unidades_dia_real = elasticity.get_unidades_dia_fulfillment(cur)
+    df = df.merge(unidades_dia_real, on=["SKU", "STORE_ID"], how="left")
     df = elasticity.aplicar_fallback_cascada(df)
 
     df = calcular_score_y_tope(df)

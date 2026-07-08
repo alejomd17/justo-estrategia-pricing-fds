@@ -27,8 +27,12 @@ export interface MechanicRow {
   GMV_TOTAL: number | null
   MARGEN_PROMEDIO: number | null
   UNIDADES_DIA: number | null
-  HISTORICO_UNIDADES_DIA: number | null
-  TRACCION: number | null
+  HISTORICO_UNIDADES_DIA_SKUS: number | null
+  HISTORICO_UNIDADES_DIA_CATEGORIA: number | null
+  TRACCION_SKUS: number | null
+  TRACCION_CATEGORIA: number | null
+  INGRESO_SUPUESTO_SIN_PROMO: number | null
+  GANANCIA_POR_ESTRATEGIA: number | null
 }
 
 export interface RedemptionRow {
@@ -64,6 +68,7 @@ export interface Filters {
   categorias: string[]
   stores: StoreOption[]
   origenes: string[]
+  adopciones: string[]
 }
 
 export interface CampaignFilters {
@@ -71,4 +76,5 @@ export interface CampaignFilters {
   categoria?: string
   store_id?: number
   origen?: string
+  adopcion?: string
 }
