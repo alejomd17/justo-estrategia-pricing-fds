@@ -251,10 +251,16 @@ def crear_postmortem_promo_v(cur) -> None:
     + FULL_MASTER_CATALOG para Departamento/Categoria (Fase 5 - filtros del
     dashboard y traccion por categoria).
 
-    COST/MARGIN/FINAL_PRICE ya NO vienen de VW_PRICING_DASHBOARD (no daba
-    confianza en el costo - Data/Finance lo confirmo). En su lugar, el CTE
-    `precio_costo_activo` trae el precio/costo vigente directo de
-    PRICE_JUSTO_MS_HISTORY: solo catalogo activo+publicado (via
+    COST/MARGIN/FINAL_PRICE: el diccionario oficial de Finanzas/Data
+    (docs/diccionario_metricas_margen.csv) confirma que la fuente
+    recomendada es MX_JUSTO_PROD.ODS_MS_PRICING.PRICE_PRODUCT_FULFILLED_PER_ITEM
+    (COST_NOMINAL, con ajuste de gramos), pero esa migracion quedo
+    BLOQUEADA el 2026-07-09: sin permiso SELECT sobre esa tabla ("SQL
+    access control error"). Mientras se consigue el permiso, se sigue
+    usando PRICE_JUSTO_MS_HISTORY (ver commit anterior / memoria
+    reference_diccionario_metricas_margen) - no es la fuente ideal, pero es
+    la que SI funciona hoy. El CTE `precio_costo_activo` trae el
+    precio/costo vigente: solo catalogo activo+publicado (via
     CURRENT_PRODUCT_CATALOG_WITH_CATEGORY, tiendas AT=9/CO=14), deduplicado
     a la fila mas reciente por PRODUCT_ID+STORE_ID+BRAND+SEGMENT_ID+
     SUBCATEGORY_ID+CATEGORY_ID+DEPARTMENT_ID (ORDER BY LOADED_LAKED_DATE

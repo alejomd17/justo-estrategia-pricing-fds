@@ -38,6 +38,47 @@ def get_departamentos_categorias(cur) -> pd.DataFrame:
     return df.rename(columns={"DEPARTMENT": "Departamento", "CATEGORY": "Categoria"})
 
 
+def get_medida_variable(cur) -> pd.DataFrame:
+    """SKU+tienda con ES_PESO_VARIABLE real desde FACT_FULFILLMENT_LINE
+    (QUANTITY_KG) - tabla ya confirmada accesible (se usa tambien en
+    postmortem.validar_redencion_real). PRICE_PRODUCT_FULFILLED_PER_ITEM
+    (la fuente que sugeria el diccionario de metricas) esta bloqueada por
+    permisos - se resolvio con esta tabla en su lugar, columnas reales
+    confirmadas en vivo el 2026-07-09: MEASUREMENT_UNIT_ID,
+    UNIT_AVERAGE_WEIGHT, QUANTITY, QUANTITY_PZ, QUANTITY_KG.
+
+    Un SKU de peso variable (fruver, ej. Tomate Verde SKU 23827) tiene su
+    precio de catalogo en $/kg, pero la mecanica de precios de strategy.py
+    (BNSP "3 x $X", BNSDP "ahorra $X c/u") lo trata como precio por pieza -
+    genero una oferta ~14x mas cara que el precio real que nadie uso (ver
+    memoria project_athenea_unidades_sospechosas). Este flag es solo para
+    marcar/revisar a mano (decision del usuario) - construir_estrategia NO
+    cambia la mecanica sola.
+
+    Si un SKU+tienda ALGUNA VEZ se vendio con QUANTITY_KG > 0, se vende por
+    peso (para SKUs por pieza QUANTITY_KG viene en 0, confirmado en la fila
+    de muestra revisada). No hace falta "la fila mas reciente" - es un
+    atributo fijo del producto, no cambia por orden."""
+    cur.execute("""
+        SELECT
+            PRODUCT_ID::VARCHAR AS SKU,
+            WAREHOUSE_ID        AS STORE_ID,
+            MAX(QUANTITY_KG)    AS MAX_QUANTITY_KG
+        FROM MX_JUSTO_PROD.DM_CORE.FACT_FULFILLMENT_LINE
+        WHERE WAREHOUSE_ID IN (9, 14)
+          AND DELIVERED_DATE IS NOT NULL
+        GROUP BY 1, 2
+    """)
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    df["SKU"] = pd.to_numeric(df["SKU"], errors="coerce")
+    df = df.dropna(subset=["SKU"])
+    df["SKU"] = df["SKU"].astype(int)
+    df["STORE_ID"] = df["STORE_ID"].astype(int)
+    df["ES_PESO_VARIABLE"] = df["MAX_QUANTITY_KG"] > 0
+    return df[["SKU", "STORE_ID", "ES_PESO_VARIABLE"]]
+
+
 def get_pricing_dashboard(cur, skus=None) -> pd.DataFrame:
     """COST/MARGIN/FINAL_PRICE/IEPS/IVA reales por SKU+tienda, para el
     post-mortem (Fase 3 del plan). Se usa SOLO para margen/costo - se

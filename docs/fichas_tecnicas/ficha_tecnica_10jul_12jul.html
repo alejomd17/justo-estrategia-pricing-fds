@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ficha técnica · Estrategia FDS 10-12 jul</title>
+<style>
+  :root {
+    --paper: #f6f7f3;
+    --ink: #16231d;
+    --muted: #56645b;
+    --line: #dbe0d6;
+    --good: #158158;
+    --good-soft: #e4f2ec;
+    --warn: #c8460f;
+    --warn-soft: #fdece3;
+    --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #10160f;
+      --ink: #ecf1ec;
+      --muted: #9fb0a4;
+      --line: #253229;
+      --good: #3ecf90;
+      --good-soft: #163325;
+      --warn: #ff8a5c;
+      --warn-soft: #3a2015;
+      --card: #161d15;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #10160f; --ink: #ecf1ec; --muted: #9fb0a4; --line: #253229;
+    --good: #3ecf90; --good-soft: #163325; --warn: #ff8a5c; --warn-soft: #3a2015; --card: #161d15;
+  }
+  :root[data-theme="light"] {
+    --paper: #f6f7f3; --ink: #16231d; --muted: #56645b; --line: #dbe0d6;
+    --good: #158158; --good-soft: #e4f2ec; --warn: #c8460f; --warn-soft: #fdece3; --card: #ffffff;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+    margin: 0;
+    padding: 3rem 1.5rem 5rem;
+  }
+  .sheet { max-width: 780px; margin: 0 auto; }
+
+  .masthead {
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 1.25rem;
+    margin-bottom: 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+  .masthead .eyebrow {
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-style: italic;
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0 0 0.35rem;
+  }
+  h1 {
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-weight: 400;
+    font-size: 2rem;
+    line-height: 1.15;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .masthead .meta {
+    text-align: right;
+    font-size: 0.8rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  h2 {
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-weight: 400;
+    font-style: italic;
+    font-size: 1.05rem;
+    color: var(--muted);
+    margin: 0 0 0.9rem;
+  }
+  section + section { margin-top: 2.5rem; }
+
+  .kpis {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+    margin-bottom: 2.5rem;
+  }
+  @media (max-width: 640px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+  .kpi {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--good);
+    border-radius: 3px;
+    padding: 0.9rem 1rem;
+  }
+  .kpi .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 0.35rem; }
+  .kpi .value { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi .sub { font-size: 0.78rem; color: var(--muted); margin-top: 0.15rem; }
+
+  .finding { display: flex; gap: 0.9rem; padding: 0.9rem 0; border-bottom: 1px solid var(--line); }
+  .finding:last-child { border-bottom: none; }
+  .pill {
+    flex-shrink: 0; font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.06em; padding: 0.28rem 0.55rem; border-radius: 2px; height: fit-content;
+    white-space: nowrap; font-family: Arial, Helvetica, sans-serif;
+  }
+  .pill.adopt { background: var(--good-soft); color: var(--good); }
+  .pill.caution { background: var(--warn-soft); color: var(--warn); }
+  .finding .body strong { font-weight: 700; }
+  .finding .body .num { font-family: "SF Mono", Consolas, "Liberation Mono", monospace; font-variant-numeric: tabular-nums; font-size: 0.94em; }
+  .finding .body p { margin: 0.3rem 0 0; color: var(--muted); font-size: 0.92rem; }
+  .finding .body .why { margin-top: 0.5rem; padding-left: 0.8rem; border-left: 2px solid var(--line); font-size: 0.88rem; color: var(--muted); }
+  .finding .body .why b { color: var(--ink); font-weight: 700; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; margin-top: 0.5rem; }
+  th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  th { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 700; }
+  td:not(:first-child), th:not(:first-child) { text-align: right; }
+  .table-wrap { overflow-x: auto; }
+
+  .naranja-tag { background: var(--warn-soft); color: var(--warn); padding: 0.1rem 0.4rem; border-radius: 2px; font-size: 0.8rem; font-weight: 700; }
+
+  .reco { background: var(--good-soft); border-radius: 4px; padding: 1.4rem 1.5rem; margin-top: 2.5rem; }
+  .reco h2 { color: var(--good); font-style: normal; font-size: 1.1rem; margin-bottom: 1rem; }
+  .reco p { margin: 0 0 0.7rem; font-size: 0.94rem; }
+  .reco p:last-child { margin-bottom: 0; }
+
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line); font-size: 0.78rem; color: var(--muted); }
+
+  @media print {
+    /* :root[data-theme="light"] pesa mas que un :root simple - hay que
+       igualar esa especificidad (y la de [data-theme="dark"]) para que
+       esta regla de impresion gane sin importar que tema haya quedado
+       activo en la pagina. */
+    :root,
+    :root[data-theme="light"],
+    :root[data-theme="dark"] {
+      --paper: #10160f; --ink: #ecf1ec; --muted: #9fb0a4; --line: #253229;
+      --good: #3ecf90; --good-soft: #163325; --warn: #ff8a5c; --warn-soft: #3a2015; --card: #161d15;
+    }
+    * { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+    body { padding: 0; background: var(--paper) !important; color: var(--ink) !important; }
+    .sheet { max-width: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <div class="masthead">
+    <div>
+      <p class="eyebrow">Estrategia de precios · fin de semana</p>
+      <h1>Estrategia FDS 10–12 julio</h1>
+    </div>
+    <div class="meta">
+      Tiendas 9 (Atizapán) · 14 (Coyoacán)<br>
+      Plan subido 2026-07-09 · 335 filas
+    </div>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi">
+      <div class="label">Cobertura</div>
+      <div class="value">335 / 3,225</div>
+      <div class="sub">10.4% del universo</div>
+    </div>
+    <div class="kpi">
+      <div class="label">GMV proyectado</div>
+      <div class="value">$37.4k → $45.4k</div>
+      <div class="sub">+21.2% escenario base</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Utilidad proyectada</div>
+      <div class="value">$11.4k → $12.8k</div>
+      <div class="sub">+12.4% escenario base</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Revisión manual</div>
+      <div class="value">3 / 335</div>
+      <div class="sub">peso variable, ya revisadas</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Qué cambió desde la campaña pasada, y por qué</h2>
+
+    <div class="finding">
+      <span class="pill adopt">Nuevo</span>
+      <div class="body">
+        <strong>Salvaguarda de peso variable — 3 ofertas marcadas para revisión.</strong>
+        <p>Cubre Frutas y Verduras y Pollo y Pavo, las categorías de peso variable presentes en esta corrida.</p>
+        <div class="why"><b>Por qué existe:</b> en la campaña pasada, el SKU 23827 recibió la mecánica "3 x $87" calculada como si su precio fuera por pieza, cuando en realidad es <span class="num">$30.70/kg</span> — una oferta ~14x más cara que el precio real que nadie usó. El flag viene de datos reales (<code>FACT_FULFILLMENT_LINE.QUANTITY_KG</code>), aplicado a cualquier categoría de peso variable, no solo fruver.</div>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill adopt">Ampliado</span>
+      <div class="body">
+        <strong>Tema Mundial ahora también por categoría, no solo por nombre — 64 ofertas capturadas.</strong>
+        <p>GMV incremental $907, utilidad incremental $162 atribuibles a este bloque.</p>
+        <div class="why"><b>Por qué se amplió:</b> el regex sobre el nombre del producto es frágil — se le escapan productos de categorías obviamente relevantes (cervezas, botanas, carnes de asador) que no traen esas palabras exactas en el nombre. Se sumaron 13 categorías reales del catálogo como segunda vía, sin quitar el regex.</div>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill adopt">Se mantiene</span>
+      <div class="body">
+        <strong>Rotación real y Q0_DIA real, ya integrados al score y a la proyección.</strong>
+        <p>314 ofertas con confianza "Alta" en la proyección (94% del total), 14 "Media", 7 "Baja".</p>
+        <div class="why"><b>Por qué se mantienen:</b> reemplazan datos estáticos (TAG_ROTACION, ATHENEA) por ventas reales de Snowflake — ya validados en la campaña anterior, sin motivo para revertirlos.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Mecánicas asignadas</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Mecánica</th><th>SKU × tienda</th></tr></thead>
+        <tbody>
+          <tr><td>SPON</td><td>172</td></tr>
+          <tr><td>BNSP</td><td>77</td></tr>
+          <tr><td>BNSDP</td><td>57</td></tr>
+          <tr><td>6x5</td><td>17</td></tr>
+          <tr><td>5x4</td><td>12</td></tr>
+          <tr><td>Sin oferta</td><td>2,890</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="font-size: 0.85rem; color: var(--muted); margin-top: 0.6rem;">Descuento exhibido promedio 7.0% · margen mínimo en promoción 22.02% (justo en el piso autónomo) · 17 SKUs adicionales requieren aprobación Comercial (colchón de margen &gt; 30%) y quedaron fuera de estas 335.</p>
+  </section>
+
+  <section>
+    <h2>Categorías priorizadas, y por qué</h2>
+    <div class="finding">
+      <div class="body">
+        <p>El post-mortem del 3-5 jul confirmó tracción real muy por encima del ritmo normal en: <strong>Destilados</strong> (6.96x y 4.48x), <strong>Queso</strong> (4.48x), <strong>Botanas</strong> (4.18x y 3.44x), <strong>Sopas/Pastas/Purés</strong> (3.24x y 2.51x). Si estos SKUs volvieron a aparecer como candidatos en esta corrida, el score ya los favoreció vía <code>ROTACION_REAL_RATIO</code> — no hizo falta ninguna regla especial adicional para "recordarlo".</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Qué requiere revisión humana, y por qué</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>SKU</th><th>Producto</th><th>Categoría</th><th>Mecánica</th><th>Precio oferta</th></tr></thead>
+        <tbody>
+          <tr><td>10968</td><td>Muslo de Pollo Orgánico</td><td>Pollo y Pavo</td><td>BNSDP 2 uds -$10 c/u</td><td>$193.93</td></tr>
+          <tr><td>10967</td><td>Pierna con Muslo de Pollo Orgánico</td><td>Pollo y Pavo</td><td>BNSDP 2 uds -$10 c/u</td><td>$221.75</td></tr>
+          <tr><td>23827</td><td>Tomate Verde sin Cáscara Selecto</td><td>Verduras</td><td>6x5</td><td>$25.58</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="font-size: 0.85rem; color: var(--muted); margin-top: 0.6rem;">Las tres se venden por peso (<span class="naranja-tag">peso variable</span> en el Excel, filas naranjas). El descuento sobre el pollo es chico (~4.9%) y de bajo riesgo; igual conviene confirmar en la app que el precio por kg se aplica como se espera antes del viernes.</p>
+  </section>
+
+  <section>
+    <h2>Riesgos aceptados, y por qué se aceptaron de todas formas</h2>
+    <div class="finding">
+      <span class="pill caution">Riesgo</span>
+      <div class="body">
+        <strong>Q0_DIA en piezas para SKUs de peso variable.</strong>
+        <p>Puede inflar <code>GMV_PROY_DIA</code>/<code>UTIL_PROY_DIA</code> hasta ~15x en filas de fruver/carnes por peso — no tomar esas proyecciones puntuales como exactas para esas 3 filas.</p>
+        <div class="why"><b>Por qué se aceptó:</b> decisión consciente del usuario — se prefirió un dato real (aunque en la unidad equivocada para estos casos) sobre seguir usando ATHENEA, que mostraba números claramente más bajos que la venta real para el mismo tipo de SKU.</div>
+      </div>
+    </div>
+    <div class="finding">
+      <span class="pill caution">A vigilar</span>
+      <div class="body">
+        <strong>Backtesting: sesgo +33.4pts sobre 27,530 observaciones.</strong>
+        <p>El modelo de uplift tiende a sobreestimar el crecimiento real por ese margen en promedio — la proyección de +21.2% en GMV probablemente sea optimista.</p>
+      </div>
+    </div>
+  </section>
+
+  <div class="reco">
+    <h2>Estado</h2>
+    <p><strong>Plan subido a <code>SANDBOX.WKND_PROMO_PLAN</code>: 335 filas.</strong> Como el fin de semana aún no se ejecuta, cada corrida nueva sobreescribe la anterior sin riesgo.</p>
+    <p>El dashboard post-mortem ya está listo para medir esta campaña en cuanto pase el fin de semana — no requiere ningún cambio adicional.</p>
+  </div>
+
+  <footer>
+    Estrategia construida con <code>oportunidad_10jul_12jul_2026.xlsx</code> (3,225 filas / 1,790 SKUs). Basada en las correcciones y hallazgos del post-mortem 3-5 jul — ver <code>docs/plan_estrategia_10jul_12jul.md</code> para el detalle técnico completo.
+  </footer>
+
+</div>
+</body>
+</html>

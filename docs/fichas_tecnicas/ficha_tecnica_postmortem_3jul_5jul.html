@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ficha técnica · Post-mortem FDS 3-5 jul</title>
+<style>
+  :root {
+    --paper: #f6f7f3;
+    --ink: #16231d;
+    --muted: #56645b;
+    --line: #dbe0d6;
+    --good: #158158;
+    --good-soft: #e4f2ec;
+    --warn: #c8460f;
+    --warn-soft: #fdece3;
+    --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #10160f;
+      --ink: #ecf1ec;
+      --muted: #9fb0a4;
+      --line: #253229;
+      --good: #3ecf90;
+      --good-soft: #163325;
+      --warn: #ff8a5c;
+      --warn-soft: #3a2015;
+      --card: #161d15;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #10160f;
+    --ink: #ecf1ec;
+    --muted: #9fb0a4;
+    --line: #253229;
+    --good: #3ecf90;
+    --good-soft: #163325;
+    --warn: #ff8a5c;
+    --warn-soft: #3a2015;
+    --card: #161d15;
+  }
+  :root[data-theme="light"] {
+    --paper: #f6f7f3;
+    --ink: #16231d;
+    --muted: #56645b;
+    --line: #dbe0d6;
+    --good: #158158;
+    --good-soft: #e4f2ec;
+    --warn: #c8460f;
+    --warn-soft: #fdece3;
+    --card: #ffffff;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+    margin: 0;
+    padding: 3rem 1.5rem 5rem;
+  }
+  .sheet { max-width: 760px; margin: 0 auto; }
+
+  .masthead {
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 1.25rem;
+    margin-bottom: 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+  .masthead .eyebrow {
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-style: italic;
+    color: var(--muted);
+    font-size: 0.85rem;
+    letter-spacing: 0.02em;
+    margin: 0 0 0.35rem;
+  }
+  h1 {
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-weight: 400;
+    font-size: 2rem;
+    line-height: 1.15;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .masthead .meta {
+    text-align: right;
+    font-size: 0.8rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  h2 {
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-weight: 400;
+    font-style: italic;
+    font-size: 1.05rem;
+    color: var(--muted);
+    letter-spacing: 0.01em;
+    margin: 0 0 0.9rem;
+    padding-top: 0.2rem;
+  }
+  section + section { margin-top: 2.5rem; }
+
+  /* quick scorecard */
+  .scorecard {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-bottom: 2.5rem;
+  }
+  @media (max-width: 560px) {
+    .scorecard { grid-template-columns: 1fr; }
+  }
+  .scorecard .col {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 1.1rem 1.2rem;
+  }
+  .scorecard .col.good { border-left: 3px solid var(--good); }
+  .scorecard .col.warn { border-left: 3px solid var(--warn); }
+  .scorecard h3 {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin: 0 0 0.7rem;
+    font-weight: 700;
+  }
+  .scorecard .col.good h3 { color: var(--good); }
+  .scorecard .col.warn h3 { color: var(--warn); }
+  .scorecard ul { margin: 0; padding-left: 1.1rem; }
+  .scorecard li { margin-bottom: 0.4rem; font-size: 0.92rem; }
+  .scorecard li:last-child { margin-bottom: 0; }
+
+  /* finding cards */
+  .finding {
+    display: flex;
+    gap: 0.9rem;
+    padding: 0.9rem 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .finding:last-child { border-bottom: none; }
+  .pill {
+    flex-shrink: 0;
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.28rem 0.55rem;
+    border-radius: 2px;
+    height: fit-content;
+    white-space: nowrap;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  .pill.adopt { background: var(--good-soft); color: var(--good); }
+  .pill.caution { background: var(--warn-soft); color: var(--warn); }
+  .pill.fixed { background: var(--line); color: var(--muted); }
+
+  .finding .body strong { font-weight: 700; }
+  .finding .body .num {
+    font-family: "SF Mono", Consolas, "Liberation Mono", monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.94em;
+  }
+  .finding .body p { margin: 0.3rem 0 0; color: var(--muted); font-size: 0.92rem; }
+
+  /* recommendation panel */
+  .reco {
+    background: var(--good-soft);
+    border-radius: 4px;
+    padding: 1.4rem 1.5rem;
+    margin-top: 2.5rem;
+  }
+  .reco h2 {
+    color: var(--good);
+    font-style: normal;
+    font-size: 1.1rem;
+    margin-bottom: 1rem;
+  }
+  .reco ol { margin: 0; padding-left: 1.2rem; }
+  .reco li { margin-bottom: 0.6rem; font-size: 0.94rem; }
+  .reco li:last-child { margin-bottom: 0; }
+  .reco li strong { font-family: Georgia, serif; font-style: italic; font-weight: 400; }
+
+  footer {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--line);
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+
+  @media print {
+    /* :root[data-theme="light"] pesa mas que un :root simple - hay que
+       igualar esa especificidad (y la de [data-theme="dark"]) para que
+       esta regla de impresion gane sin importar que tema haya quedado
+       activo en la pagina. */
+    :root,
+    :root[data-theme="light"],
+    :root[data-theme="dark"] {
+      --paper: #10160f; --ink: #ecf1ec; --muted: #9fb0a4; --line: #253229;
+      --good: #3ecf90; --good-soft: #163325; --warn: #ff8a5c; --warn-soft: #3a2015; --card: #161d15;
+    }
+    * { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+    body { padding: 0; background: var(--paper) !important; color: var(--ink) !important; }
+    .sheet { max-width: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <div class="masthead">
+    <div>
+      <p class="eyebrow">Estrategia de precios · fin de semana</p>
+      <h1>Post-mortem FDS 3–5 julio</h1>
+    </div>
+    <div class="meta">
+      Tiendas 9 (Atizapán) · 14 (Coyoacán)<br>
+      Ficha preparada 2026-07-09
+    </div>
+  </div>
+
+  <div class="scorecard">
+    <div class="col good">
+      <h3>Adoptar hoy</h3>
+      <ul>
+        <li>Rotación real por categoría en el score</li>
+        <li>Destilados, Queso, Botanas, Sopas/Pastas — tracción confirmada</li>
+        <li>Dashboard recurrente ya listo, sin trabajo extra</li>
+      </ul>
+    </div>
+    <div class="col warn">
+      <h3>Cuidado hoy</h3>
+      <ul>
+        <li>Mecánicas "N x $" en fruver / peso variable</li>
+        <li>Universo sigue acotado a 2,472 SKUs de oportunidad.xlsx</li>
+        <li>Costo/margen del post-mortem, aún sin migrar a la fuente oficial</li>
+      </ul>
+    </div>
+  </div>
+
+  <section>
+    <h2>Qué funcionó — adoptar</h2>
+
+    <div class="finding">
+      <span class="pill adopt">Adoptar</span>
+      <div class="body">
+        <strong>Rotación real por categoría, ya en el score de priorización.</strong>
+        <p><code>rotacion.py</code> reemplaza el tag estático de rotación por un ritmo de venta real calculado de <span class="num">MASTER_ORDERLINE</span>, comparado contra el promedio de su categoría. Ya está integrado a <span class="num">SCORE</span> vía <span class="num">PESO_ROTACION_REAL</span> — sigue corriendo solo, no necesita nada nuevo hoy.</p>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill adopt">Adoptar</span>
+      <div class="body">
+        <strong>Categorías con tracción confirmada muy por encima de su ritmo normal.</strong>
+        <p>Destilados <span class="num">6.96x</span> y <span class="num">4.48x</span>, Queso <span class="num">4.48x</span>, Botanas <span class="num">4.18x</span> / <span class="num">3.44x</span>, Sopas/Pastas/Purés <span class="num">3.24x</span> / <span class="num">2.51x</span>, Pescados y Mariscos <span class="num">2.58x</span>, Listos para Comer <span class="num">2.58x</span>, Galletas <span class="num">2.51x</span>. Si vuelven a ser candidatas hoy, priorizarlas de nuevo.</p>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill adopt">Adoptar</span>
+      <div class="body">
+        <strong>Dashboard de medición recurrente, sin trabajo manual por campaña.</strong>
+        <p>Las vistas en Snowflake se recalculan solas contra cualquier ventana nueva. Correr el post-mortem de la campaña de hoy es solo elegir la fecha en el selector — no hay que reconstruir nada.</p>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill adopt">Adoptar</span>
+      <div class="body">
+        <strong>Mecánica propuesta vs. mecánica real, con filtro de adopción.</strong>
+        <p>Deja ver cuándo algo se propuso pero nunca se ejecutó de verdad — chequeo estándar a correr después de cada campaña, no solo esta.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Bugs de medición — corregidos, lección para no repetir</h2>
+
+    <div class="finding">
+      <span class="pill fixed">Corregido</span>
+      <div class="body">
+        <strong>Campañas comerciales traslapadas inflaban ventas hasta <span class="num">300x</span>.</strong>
+        <p>SKU 18756 mostraba <span class="num">2,898</span> unidades reportadas vs. <span class="num">8–9</span> reales. Una venta se multiplicaba por cada campaña vieja que la tocaba de paso. Corregido con deduplicación en la vista base.</p>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill fixed">Corregido</span>
+      <div class="body">
+        <strong>Un mismo SKU se partía en varias filas si la mecánica real cambiaba de un día a otro.</strong>
+        <p>SKU 23827 mostraba <span class="num">258</span> unidades cuando el fin de semana completo fueron <span class="num">747</span>. Corregido: se suman todos los días del SKU antes de reportar.</p>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill fixed">Corregido</span>
+      <div class="body">
+        <strong>La "mecánica dominante" mostrada podía decir "sin mecánica" aunque sí hubo una.</strong>
+        <p>Pasaba cuando los días sin promo vendían más volumen que el día con promo. Corregido: cualquier mecánica real gana sobre "sin mecánica", sin importar el volumen.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Problemas de fondo — sin resolver, cuidado hoy</h2>
+
+    <div class="finding">
+      <span class="pill caution">Cuidado</span>
+      <div class="body">
+        <strong>Precio de catálogo en $/kg tratado como precio por pieza en fruver.</strong>
+        <p>El tomate del SKU 23827 se catalogó a <span class="num">$30.70/kg</span>, pero la mecánica propuso <span class="num">"3 x $87"</span> como si fuera por pieza — <span class="num">~14x</span> más caro que el precio real. Nadie la usó. Revisar a mano cualquier mecánica "N x $" en Frutas y Verduras antes de publicar.</p>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill caution">Cuidado</span>
+      <div class="body">
+        <strong>El universo evaluado sigue siendo un subconjunto pre-filtrado.</strong>
+        <p>Solo <span class="num">2,472</span> filas de <code>oportunidad.xlsx</code>, no el catálogo completo. Si un producto importante no aparece hoy, puede ser porque no está en ese universo — no porque el modelo lo haya descartado.</p>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill caution">Cuidado</span>
+      <div class="body">
+        <strong>Costo/margen del post-mortem aún no usa la fuente oficial de Finanzas.</strong>
+        <p>Hoy se confirmó que la fuente correcta es <code>PRICE_PRODUCT_FULFILLED_PER_ITEM.COST_NOMINAL</code>, no lo que usa hoy el dashboard. Los márgenes que muestra el post-mortem pueden no ser exactos todavía.</p>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="pill caution">Cuidado</span>
+      <div class="body">
+        <strong>Q0_DIA ahora viene de piezas reales, con un riesgo aceptado.</strong>
+        <p>Para SKUs de peso variable, el volumen proyectado de la próxima estrategia puede salir inflado <span class="num">~15x</span> — mismo problema del punto de fruver, ahora en la proyección hacia adelante.</p>
+      </div>
+    </div>
+  </section>
+
+  <div class="reco">
+    <h2>Recomendación concreta para hoy</h2>
+    <ol>
+      <li><strong>Mantener</strong> — dejar activo <span class="num">ROTACION_REAL_RATIO</span> en el score y priorizar de nuevo las categorías con tracción alta confirmada.</li>
+      <li><strong>Revisar a mano</strong> — cualquier mecánica "N x $" propuesta para Frutas y Verduras u otro SKU de peso variable, comparando el precio de oferta contra el precio real en la app antes de publicar.</li>
+      <li><strong>Tener presente</strong> — si falta un producto importante en la estrategia, primero revisar si está en <code>oportunidad.xlsx</code> antes de asumir que el modelo lo descartó.</li>
+      <li><strong>Medir igual</strong> — correr el post-mortem de esta campaña nueva en el mismo dashboard, sin cambios adicionales.</li>
+    </ol>
+  </div>
+
+  <footer>
+    Basado en el post-mortem de la campaña 3–5 jul 2026 y las correcciones aplicadas en esta sesión. Ver memoria del proyecto para el detalle técnico de cada punto.
+  </footer>
+
+</div>
+</body>
+</html>

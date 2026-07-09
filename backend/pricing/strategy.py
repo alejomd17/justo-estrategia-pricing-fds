@@ -51,6 +51,16 @@ PATRON_MUNDIAL = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+# Complemento al regex de nombre (frágil - se le escapan productos de
+# categorías obvias sin esas palabras exactas en el nombre). Categorías
+# reales del catálogo, alcance confirmado con el usuario: bebidas/botanas
+# directas + acompañamientos + carnes de asador ("viendo el partido" +
+# carne asada, occasion tipica en Mexico).
+CATEGORIAS_MUNDIAL = {
+    "Cervezas y Coolers", "Destilados", "Vinos", "Refrescos",
+    "Botanas", "Snacks Dulces y Salados", "Salsas y Aderezos", "Queso",
+    "Carne de Res", "Carne de Cerdo", "Embutidos", "Salchichas", "Tocino",
+}
 
 # ---------- Pesos del score ----------
 ELAS_W = {"ALTAMENTE ELASTICO": 3, "ELASTICO": 2, "POCO ELASTICO": 1, "INELASTICO": 0, "SIN DATOS": 0}
@@ -149,6 +159,18 @@ def agregar_rotacion_real(df: pd.DataFrame, cur) -> pd.DataFrame:
     return df
 
 
+def agregar_medida_variable(df: pd.DataFrame, cur) -> pd.DataFrame:
+    """Merge con ES_PESO_VARIABLE real (catalog.get_medida_variable, desde
+    FACT_FULFILLMENT_LINE.QUANTITY_KG) - marca SKUs de peso variable
+    (fruver, ej. Tomate Verde SKU 23827) donde el precio de catalogo esta
+    en $/kg pero la mecanica de precios lo trataria como precio por pieza.
+    Solo marca para revision manual, no cambia _asignar_mecanica."""
+    medida = catalog.get_medida_variable(cur)
+    df = df.merge(medida, on=["SKU", "STORE_ID"], how="left")
+    df["ES_PESO_VARIABLE"] = df["ES_PESO_VARIABLE"].fillna(False)
+    return df
+
+
 def calcular_margen_neto(df: pd.DataFrame) -> pd.DataFrame:
     """Agrega PRECIO_NETO (util para pesos de utilidad mas abajo). No
     reconstruye MARGEN - esa columna del export es la fuente de verdad."""
@@ -173,7 +195,14 @@ def marcar_elegibilidad(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def detectar_tema_mundial(df: pd.DataFrame) -> pd.DataFrame:
-    df["TEMA_MUNDIAL"] = df["Nombre"].str.contains(PATRON_MUNDIAL, na=False)
+    """Regex de nombre (frágil por sí solo) + Categoria real
+    (CATEGORIAS_MUNDIAL) - la categoría se suma como segunda vía, no
+    reemplaza al regex (este sigue capturando casos fuera de esas
+    categorías, ej. marcas de salsa específicas). Requiere que `df` ya
+    traiga Categoria (merge previo con agregar_catalogo_real)."""
+    df["TEMA_MUNDIAL"] = df["Nombre"].str.contains(PATRON_MUNDIAL, na=False) | df["Categoria"].isin(
+        CATEGORIAS_MUNDIAL
+    )
     return df
 
 
@@ -502,6 +531,7 @@ def exportar_excel(
         "ROTACION_REAL_RATIO", "DIAS_ENTRE_VENTA_SKU_TIENDA", "DIAS_ENTRE_VENTA_CATEGORIA_BASELINE",
         "FUENTE_BASELINE_CATEGORIA",
         "PROMO ACTIVA HOY", "TEMA_MUNDIAL", "MOTIVO_SIN_OFERTA", "REQUIERE_APROBACION",
+        "ES_PESO_VARIABLE",
         "DMAX_REAL", "ESTRATEGIA", "DIA_EJECUCION", "PRECIO_OFERTA", "DESC_EFECTIVO",
         "MARGEN_OFERTA", "FUENTE_ELASTICIDAD", "FUENTE_Q0", "CONFIANZA_PROYECCION",
         "REDENCION", "ELASTICIDAD_FINAL", "UPLIFT", "Q0_DIA", "Q1_DIA",
@@ -520,6 +550,7 @@ def exportar_excel(
             "MARGEN_OFERTA": "MARGEN_OFERTA_%",
             "UPLIFT": "UPLIFT_%",
             "DMAX_REAL": "DMAX_REAL_%",
+            "ES_PESO_VARIABLE": "REQUIERE_REVISION_PESO_VARIABLE",
         }
     )
     out = out.sort_values(["DIA_EJECUCION", "STORE_ID", "ESTRATEGIA"]).reset_index(drop=True)
@@ -533,6 +564,7 @@ def exportar_excel(
                 "Fin de semana objetivo", "Universo (tienda x SKU)", "Ofertas asignadas", "% cobertura",
                 "Descuento exhibido promedio", "Margen minimo en promocion",
                 "Requieren aprobacion Comercial (d_max > 30%)", "Ofertas Tema Mundial",
+                "Requieren revision manual por peso variable",
                 "Unidades base -> proyectadas (escenario base)",
                 "GMV base -> proyectado (escenario base)", "Utilidad base -> proyectada (escenario base)",
                 "Utilidad incremental total (base)", "Backtesting (n, MAE, sesgo)", "Guardrails aplicados",
@@ -542,6 +574,7 @@ def exportar_excel(
                 f"{len(ofer)/len(df)*100:.1f}%", f"{ofer['DESC_EFECTIVO'].mean()*100:.1f}%",
                 f"{ofer['MARGEN_OFERTA'].min():.2f}%", int(df["REQUIERE_APROBACION"].sum()),
                 int(ofer["TEMA_MUNDIAL"].sum()),
+                f"{int(ofer['ES_PESO_VARIABLE'].sum())} de {len(ofer)} ofertas",
                 f"{ofer['Q0_DIA'].sum():,.0f} -> {ofer['Q1_DIA'].sum():,.0f}",
                 f"${ofer['GMV_BASE_DIA'].sum():,.0f} -> ${ofer['GMV_PROY_DIA'].sum():,.0f}",
                 f"${ofer['UTIL_BASE_DIA'].sum():,.0f} -> ${ofer['UTIL_PROY_DIA'].sum():,.0f}",
@@ -563,7 +596,8 @@ def exportar_excel(
         [
             ("MOTIVO_SIN_OFERTA", "Por que la fila no lleva oferta (solo aplica en la hoja Descartados)"),
             ("REQUIERE_APROBACION / DMAX_REAL_%", "True si el colchon de margen real supera el tope autonomo de 30%; DMAX_REAL_% es ese colchon completo"),
-            ("TEMA_MUNDIAL", "True si el nombre coincide con el patron de consumo 'ver el partido'"),
+            ("TEMA_MUNDIAL", "True si el nombre o la categoria (CATEGORIAS_MUNDIAL) coinciden con el patron de consumo 'ver el partido' - bebidas/botanas/acompañamientos/carnes de asador"),
+            ("REQUIERE_REVISION_PESO_VARIABLE", "True si el SKU se mide en GRAMOS (peso variable, ej. fruver) - su PRECIO JUSTO/COSTO estan en $/kg pero la mecanica de precios los trata como precio por pieza, revisar a mano el precio de oferta antes de publicar (caso detectado: SKU 23827, Tomate Verde)"),
             ("ROTACION_REAL_RATIO", "Unidades/dia real del SKU dividido entre el promedio real de su categoria (rotacion.py) - 1.0 = en linea con su categoria, ya no depende solo del TAG_ROTACION estatico"),
             ("DIAS_ENTRE_VENTA_SKU_TIENDA / _CATEGORIA_BASELINE", "Dias promedio entre una venta y otra: del SKU, y el tipico de su categoria - para comparar ritmos de compra justo (ej. platano vs cepillo de dientes)"),
             ("FUENTE_BASELINE_CATEGORIA", "Categoria x tienda / Categoria (ambas tiendas) / Sin baseline - de donde salio el baseline de rotacion de la categoria"),
@@ -593,10 +627,11 @@ def exportar_excel(
 
         wb = w.book
         hdr = PatternFill("solid", start_color="1F4E79")
-        verde, dorado, azul = (
+        verde, dorado, azul, naranja = (
             PatternFill("solid", start_color="E2EFDA"),
             PatternFill("solid", start_color="FFF2CC"),
             PatternFill("solid", start_color="DDEBF7"),
+            PatternFill("solid", start_color="FCE4D6"),
         )
 
         for hoja_nombre in ["Estrategia FDS", "Descartados"]:
@@ -610,9 +645,19 @@ def exportar_excel(
             headers = [c.value for c in ws[1]]
             i_mun = headers.index("TEMA_MUNDIAL")
             i_apr = headers.index("REQUIERE_APROBACION")
+            i_peso = headers.index("REQUIERE_REVISION_PESO_VARIABLE")
             for row in ws.iter_rows(min_row=2):
                 if hoja_nombre == "Estrategia FDS":
-                    f = azul if row[i_apr].value else (dorado if row[i_mun].value else verde)
+                    # Peso variable primero (precio posiblemente mal calculado,
+                    # la mas urgente de revisar), luego aprobacion, luego mundial.
+                    if row[i_peso].value:
+                        f = naranja
+                    elif row[i_apr].value:
+                        f = azul
+                    elif row[i_mun].value:
+                        f = dorado
+                    else:
+                        f = verde
                     for cell in row:
                         cell.fill = f
             for i in range(1, ws.max_column + 1):
@@ -693,6 +738,7 @@ def construir_estrategia(
     df = excluir_comercial(df, ruta_descuentos, weekend_inicio, weekend_fin)
     df = agregar_catalogo_real(df, cur)
     df = agregar_rotacion_real(df, cur)
+    df = agregar_medida_variable(df, cur)
     df = calcular_margen_neto(df)
     df = marcar_elegibilidad(df)
     df = detectar_tema_mundial(df)
@@ -723,6 +769,7 @@ def construir_estrategia(
 
     ofer = df[df["MECANICA"] != "Sin oferta"]
     print(f"Ofertas: {len(ofer)} de {len(df)} ({len(ofer)/len(df)*100:.1f}%)")
+    print(f"Requieren revision manual por peso variable: {int(ofer['ES_PESO_VARIABLE'].sum())} de {len(ofer)} ofertas")
     if len(backtest):
         print(f"Backtesting: n={len(backtest)} | MAE={mae:.1f}pts | sesgo={bias:+.1f}pts")
     return df
