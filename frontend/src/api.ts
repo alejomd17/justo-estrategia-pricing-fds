@@ -4,7 +4,6 @@ import type {
   CampaignFilters,
   Filters,
   MechanicRow,
-  RedemptionRow,
   TopSkuRow,
 } from './types'
 
@@ -42,10 +41,6 @@ export function fetchSummary(start: string, end: string, filters?: CampaignFilte
 
 export function fetchMechanics(start: string, end: string, filters?: CampaignFilters): Promise<MechanicRow[]> {
   return getJson(`/campaigns/${start}/${end}/mechanics`, filters)
-}
-
-export function fetchRedemption(start: string, end: string): Promise<RedemptionRow[]> {
-  return getJson(`/campaigns/${start}/${end}/redemption`)
 }
 
 export function fetchTopSkus(start: string, end: string, filters?: CampaignFilters): Promise<TopSkuRow[]> {

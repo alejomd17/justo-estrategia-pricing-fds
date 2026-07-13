@@ -42,14 +42,21 @@ export default function KpiCards({ summary, mechanics }: Props) {
         <div className="kpi-label">Traccion promedio</div>
         <div className="kpi-value">{traccion == null ? 'N/D' : `${traccion.toFixed(2)}x`}</div>
       </div>
-      {summary.por_origen.map((row) => (
-        <div className="kpi-card" key={row.ORIGEN_CAMPANA}>
-          <div className="kpi-label">{row.ORIGEN_CAMPANA}</div>
-          <div className="kpi-value">
-            {row.SKU_TIENDAS_CON_PROMO_REAL} / {row.SKU_TIENDAS}
+      {/* "Sin promo" sacada de la vista a proposito - un SKU sin ninguna
+          oferta propuesta ni ejecutada no aporta a un post-mortem de
+          campana (mismo criterio que performance_por_mecanica/top_skus en
+          el backend). No borrada del todo: eventualmente se vuelve a
+          mostrar en otro lado (ej. un panorama general aparte). */}
+      {summary.por_origen
+        .filter((row) => row.ORIGEN_CAMPANA !== 'Sin promo')
+        .map((row) => (
+          <div className="kpi-card" key={row.ORIGEN_CAMPANA}>
+            <div className="kpi-label">{row.ORIGEN_CAMPANA}</div>
+            <div className="kpi-value">
+              {row.SKU_TIENDAS_CON_PROMO_REAL} / {row.SKU_TIENDAS}
+            </div>
           </div>
-        </div>
-      ))}
+        ))}
       <p style={{ width: '100%', fontSize: '0.85rem', opacity: 0.7 }}>
         Nota: la adopcion compara contra toda la ventana de la campana, no contra el dia
         especifico planeado para cada SKU (aproximado, no exacto).

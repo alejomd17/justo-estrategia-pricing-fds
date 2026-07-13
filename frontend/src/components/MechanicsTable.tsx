@@ -4,6 +4,8 @@ import DataTable, { type Column } from './DataTable'
 
 interface Props {
   rows: MechanicRow[]
+  onRowClick?: (row: MechanicRow) => void
+  isRowSelected?: (row: MechanicRow) => boolean
 }
 
 function numero(v: number | null | undefined): string {
@@ -56,10 +58,14 @@ const columns: Column<MechanicRow>[] = [
   },
 ]
 
-export default function MechanicsTable({ rows }: Props) {
+export default function MechanicsTable({ rows, onRowClick, isRowSelected }: Props) {
   return (
     <div>
-      <DataTable columns={columns} rows={rows} pageSize={10} />
+      <DataTable columns={columns} rows={rows} pageSize={10} onRowClick={onRowClick} isRowSelected={isRowSelected} />
+      <p style={{ fontSize: '0.85rem', opacity: 0.7, marginTop: '0.5rem' }}>
+        Click en una fila para filtrar la tabla de SKUs mas vendidos por esa misma mecanica/
+        origen/departamento/categoria/bodega.
+      </p>
       <p style={{ fontSize: '0.85rem', opacity: 0.7, marginTop: '0.5rem' }}>
         Traccion = unidades/dia de esta fila vs. el historico de SOLO los SKUs que participan
         aqui, sumado - responde si esos SKUs especificos crecieron. Mayor a 1x = vendio por

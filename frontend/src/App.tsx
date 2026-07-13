@@ -1,19 +1,17 @@
 import { useEffect, useState } from 'react'
-import { fetchCampaigns, fetchFilters, fetchMechanics, fetchRedemption, fetchSummary, fetchTopSkus } from './api'
+import { fetchCampaigns, fetchFilters, fetchMechanics, fetchSummary, fetchTopSkus } from './api'
 import type {
   AdoptionSummary,
   Campaign,
   CampaignFilters,
   Filters,
   MechanicRow,
-  RedemptionRow,
   TopSkuRow,
 } from './types'
 import CampaignSelector from './components/CampaignSelector'
 import FilterBar from './components/FilterBar'
 import KpiCards from './components/KpiCards'
 import MechanicsTable from './components/MechanicsTable'
-import RedemptionTable from './components/RedemptionTable'
 import TopSkusTable from './components/TopSkusTable'
 import TopChartsSection from './components/TopChartsSection'
 import './App.css'
@@ -30,10 +28,13 @@ function App() {
   })
   const [summary, setSummary] = useState<AdoptionSummary | null>(null)
   const [mechanics, setMechanics] = useState<MechanicRow[]>([])
-  const [redemption, setRedemption] = useState<RedemptionRow[]>([])
   const [topSkus, setTopSkus] = useState<TopSkuRow[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Fila de "Performance FDS" seleccionada por click, para filtrar la tabla
+  // de SKUs mas vendidos por esa misma mecanica/origen/departamento/
+  // categoria/bodega - null = sin filtro, se ve todo.
+  const [selectedGroup, setSelectedGroup] = useState<MechanicRow | null>(null)
 
   useEffect(() => {
     fetchCampaigns()
@@ -55,21 +56,6 @@ function App() {
       .catch((e) => setError(String(e)))
   }, [])
 
-  // Depende solo de la campana elegida, NO de los filtros - redencion viene
-  // de FACT_FULFILLMENT_LINE directo, ningun filtro (departamento/categoria/
-  // bodega/origen) le aplica. Antes se volvia a pedir en cada cambio de
-  // filtro sin necesidad - el mismo query pesado, repetido para nada.
-  useEffect(() => {
-    if (!selected) return
-    let ignore = false
-    fetchRedemption(selected.CAMPAIGN_START, selected.CAMPAIGN_END)
-      .then((r) => !ignore && setRedemption(r))
-      .catch((e) => !ignore && setError(String(e)))
-    return () => {
-      ignore = true
-    }
-  }, [selected])
-
   useEffect(() => {
     if (!selected) return
     // `ignore` evita que una respuesta vieja (ej. el fetch inicial sin
@@ -79,6 +65,7 @@ function App() {
     let ignore = false
     setLoading(true)
     setError(null)
+    setSelectedGroup(null) // la campana/filtro cambio - la fila seleccionada de antes ya no aplica
     Promise.all([
       fetchSummary(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
       fetchMechanics(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
@@ -96,6 +83,21 @@ function App() {
       ignore = true
     }
   }, [selected, campaignFilters])
+
+  // TopSkuRow no trae MECANICA_PLANEADA, asi que el match es por las 5
+  // dimensiones que si comparte con MechanicRow (mismo grano que agrupa
+  // performance_por_mecanica, menos la mecanica propuesta).
+  function coincideConGrupo(sku: TopSkuRow, grupo: MechanicRow): boolean {
+    return (
+      sku.STORE_ID === grupo.STORE_ID &&
+      sku.DEPARTAMENTO === grupo.DEPARTAMENTO &&
+      sku.CATEGORIA === grupo.CATEGORIA &&
+      sku.MECANICA_EJECUTADA === grupo.MECANICA_EJECUTADA &&
+      sku.ORIGEN_CAMPANA === grupo.ORIGEN_CAMPANA
+    )
+  }
+
+  const topSkusFiltrados = selectedGroup ? topSkus.filter((s) => coincideConGrupo(s, selectedGroup)) : topSkus
 
   return (
     <div style={{ padding: '2rem', maxWidth: '1800px', margin: '0 auto' }}>
@@ -124,7 +126,11 @@ function App() {
         {mechanics.length > 0 && (
           <section style={{ marginTop: '1.5rem' }}>
             <h2>Performance FDS</h2>
-            <MechanicsTable rows={mechanics} />
+            <MechanicsTable
+              rows={mechanics}
+              onRowClick={(row) => setSelectedGroup((prev) => (prev === row ? null : row))}
+              isRowSelected={(row) => row === selectedGroup}
+            />
           </section>
         )}
 
@@ -137,15 +143,19 @@ function App() {
 
         {topSkus.length > 0 && (
           <section style={{ marginTop: '1.5rem' }}>
-            <h2>SKUs mas vendidos FDS</h2>
-            <TopSkusTable rows={topSkus} />
-          </section>
-        )}
-
-        {redemption.length > 0 && (
-          <section style={{ marginTop: '1.5rem' }}>
-            <h2>Validacion de redencion</h2>
-            <RedemptionTable rows={redemption} />
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              <h2 style={{ margin: 0 }}>SKUs mas vendidos FDS</h2>
+              {selectedGroup && (
+                <>
+                  <span style={{ fontSize: '0.85rem', opacity: 0.8 }}>
+                    Filtrado por: {selectedGroup.CATEGORIA ?? 'N/D'} · {selectedGroup.MECANICA_EJECUTADA ?? 'Sin mecanica'} ·{' '}
+                    {selectedGroup.ORIGEN_CAMPANA}
+                  </span>
+                  <button onClick={() => setSelectedGroup(null)}>Quitar filtro</button>
+                </>
+              )}
+            </div>
+            <TopSkusTable rows={topSkusFiltrados} />
           </section>
         )}
       </div>

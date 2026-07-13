@@ -13,9 +13,11 @@ interface Props<T> {
   columns: Column<T>[]
   rows: T[]
   pageSize?: number
+  onRowClick?: (row: T) => void
+  isRowSelected?: (row: T) => boolean
 }
 
-export default function DataTable<T>({ columns, rows, pageSize = 10 }: Props<T>) {
+export default function DataTable<T>({ columns, rows, pageSize = 10, onRowClick, isRowSelected }: Props<T>) {
   const [page, setPage] = useState(0)
   const [sortKey, setSortKey] = useState<string | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
@@ -74,15 +76,25 @@ export default function DataTable<T>({ columns, rows, pageSize = 10 }: Props<T>)
           </tr>
         </thead>
         <tbody>
-          {paged.map((row, i) => (
-            <tr key={i}>
-              {columns.map((c) => (
-                <td key={c.key}>
-                  {c.render ? c.render(row) : String((row as Record<string, unknown>)[c.key] ?? 'N/D')}
-                </td>
-              ))}
-            </tr>
-          ))}
+          {paged.map((row, i) => {
+            const selected = isRowSelected?.(row) ?? false
+            return (
+              <tr
+                key={i}
+                onClick={onRowClick ? () => onRowClick(row) : undefined}
+                style={{
+                  cursor: onRowClick ? 'pointer' : undefined,
+                  background: selected ? 'var(--accent-bg)' : undefined,
+                }}
+              >
+                {columns.map((c) => (
+                  <td key={c.key}>
+                    {c.render ? c.render(row) : String((row as Record<string, unknown>)[c.key] ?? 'N/D')}
+                  </td>
+                ))}
+              </tr>
+            )
+          })}
         </tbody>
       </table>
       {pageCount > 1 && (

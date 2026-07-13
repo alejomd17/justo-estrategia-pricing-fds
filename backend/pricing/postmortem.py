@@ -15,9 +15,13 @@ crear_postmortem_promo_v) - no de VW_PRICING_DASHBOARD, que no daba
 confianza en el costo.
 """
 
+import html
+import math
+from pathlib import Path
+
 import pandas as pd
 
-from . import rotacion
+from . import catalog, rotacion
 from .strategy import REDENCION
 
 SCHEMA = "MX_JUSTO_PROD.SANDBOX"
@@ -411,10 +415,28 @@ def performance_por_mecanica(
     sueltos, mostrando solo una fraccion de las unidades reales del fin de
     semana de ese SKU (se detecto en vivo: SKU 23827 mostraba 258 unidades
     en el dashboard cuando el fin de semana completo sumaba 258+149+lo del
-    domingo)."""
+    domingo).
+
+    ORIGEN_CAMPANA = 'Sin promo' se excluye SIEMPRE (no es un filtro
+    opcional): esto es un post-mortem de CAMPAÑA, no un reporte de ventas
+    general - una categoria sin ninguna oferta propuesta ni ejecutada no
+    aporta nada a "¿como nos fue con la campaña?", y su GMV organico (a
+    veces enorme, ej. Frutas y Verduras) solo satura la tabla y distorsiona
+    cualquier lectura. Si se necesita ver el panorama sin promo, usar
+    `resumen_adopcion`, que si lo incluye a proposito para el KPI de
+    cobertura.
+
+    Peso variable (catalog.get_medida_variable, ES_PESO_VARIABLE real por
+    SKU+tienda): INGRESO_SUPUESTO_SIN_PROMO/GANANCIA_POR_ESTRATEGIA salen
+    NULL si el grupo tiene algun SKU de peso variable - el mismo problema
+    del SKU 23827 (precio en $/kg contra unidades reales en piezas) aparecia
+    agregado a nivel de categoria completa (ej. Verduras mostraba una
+    "perdida" de -$723k que en realidad era el mismatch de unidad, no un
+    resultado real de negocio)."""
     condiciones, params_filtro = _filtros_departamento_categoria_tienda(
         departamento, categoria, store_id, origen, adopcion=None
     )
+    condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
     where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
     cur.execute(
         f"""
@@ -492,6 +514,14 @@ def performance_por_mecanica(
     baseline_sku = baseline[["SKU", "STORE_ID", "UNIDADES_DIA_SKU_TIENDA"]]
     detalle_sku = detalle_sku.merge(baseline_sku, on=["SKU", "STORE_ID"], how="left")
 
+    # ES_PESO_VARIABLE real por SKU+tienda (FACT_FULFILLMENT_LINE.QUANTITY_KG
+    # via catalog.get_medida_variable) - mismo dato que usa la salvaguarda de
+    # la estrategia (strategy.agregar_medida_variable), no una lista de
+    # categorias armada a mano.
+    medida = catalog.get_medida_variable(cur)
+    detalle_sku = detalle_sku.merge(medida, on=["SKU", "STORE_ID"], how="left")
+    detalle_sku["ES_PESO_VARIABLE"] = detalle_sku["ES_PESO_VARIABLE"].fillna(False)
+
     dias_ventana = (campaign_end - campaign_start).days + 1
     detalle_sku["INGRESO_SUPUESTO_SIN_PROMO"] = (
         detalle_sku["PRECIO_PROMEDIO"] * detalle_sku["UNIDADES_DIA_SKU_TIENDA"] * dias_ventana
@@ -507,6 +537,7 @@ def performance_por_mecanica(
             MARGEN_PROMEDIO=("MARGEN_PROMEDIO", "mean"),
             HISTORICO_UNIDADES_DIA_SKUS=("UNIDADES_DIA_SKU_TIENDA", "sum"),
             INGRESO_SUPUESTO_SIN_PROMO=("INGRESO_SUPUESTO_SIN_PROMO", "sum"),
+            ES_PESO_VARIABLE=("ES_PESO_VARIABLE", "any"),
         )
         .reset_index()
     )
@@ -520,6 +551,14 @@ def performance_por_mecanica(
     df["TRACCION_SKUS"] = df["UNIDADES_DIA"] / df["HISTORICO_UNIDADES_DIA_SKUS"]
     df["TRACCION_CATEGORIA"] = df["UNIDADES_DIA"] / df["HISTORICO_UNIDADES_DIA_CATEGORIA"]
     df["GANANCIA_POR_ESTRATEGIA"] = df["GMV_TOTAL"] - df["INGRESO_SUPUESTO_SIN_PROMO"]
+
+    # PRECIO_PROMEDIO viene en $/kg para SKUs de peso variable, pero
+    # UNIDADES_DIA_SKU_TIENDA esta en piezas - la resta sale sin sentido (ver
+    # docstring, caso SKU 23827). Si ALGUN SKU del grupo es de peso
+    # variable, se anula el grupo completo - mejor NULL que un numero
+    # parcial o equivocado.
+    df.loc[df["ES_PESO_VARIABLE"], ["INGRESO_SUPUESTO_SIN_PROMO", "GANANCIA_POR_ESTRATEGIA"]] = None
+
     return df.sort_values("GMV_TOTAL", ascending=False)
 
 
@@ -592,10 +631,16 @@ def top_skus(
     a dia para un mismo SKU, asi que se colapsa a UNA fila por SKU+tienda
     ANTES de rankear/filtrar por adopcion - de lo contrario el ORDER BY +
     LIMIT de SQL rankeaba fragmentos sueltos (una fraccion de las unidades
-    reales de cada SKU), no el total del fin de semana."""
+    reales de cada SKU), no el total del fin de semana.
+
+    ORIGEN_CAMPANA = 'Sin promo' se excluye SIEMPRE, igual que en
+    performance_por_mecanica - este ranking es de SKUs de campaña, no un
+    top general de ventas (un SKU sin ninguna oferta propuesta ni ejecutada
+    no aporta al post-mortem)."""
     condiciones, params_filtro = _filtros_departamento_categoria_tienda(
         departamento, categoria, store_id, origen, adopcion=None
     )
+    condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
     where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
     cur.execute(
         f"""
@@ -740,3 +785,379 @@ def validar_redencion_real(cur, campaign_start: pd.Timestamp, campaign_end: pd.T
     df["REDENCION_SUPUESTA"] = df["TIER"].map(tier_a_supuesta)
     df["DIFERENCIA"] = (df["REDENCION_REAL"] - df["REDENCION_SUPUESTA"]).round(4)
     return df.sort_values("UNIDADES_TOTALES", ascending=False)
+
+
+def _fmt_moneda(v) -> str:
+    return "N/D" if pd.isna(v) else f"${v:,.0f}"
+
+
+def _fmt_num(v) -> str:
+    return "N/D" if pd.isna(v) else f"{v:,.0f}"
+
+
+def _fmt_pct(v) -> str:
+    return "N/D" if pd.isna(v) else f"{v:.1f}%"
+
+
+def _fmt_ratio(v) -> str:
+    return "N/D" if pd.isna(v) else f"{v:.2f}x"
+
+
+def _fmt_num_ceil(v) -> str:
+    return "N/D" if pd.isna(v) else f"{math.ceil(v):,d}"
+
+
+_STORE_NAMES_REPORTE = {9: "Atizapan", 14: "Coyoacan"}
+
+
+def _fmt_bodega(v) -> str:
+    return "N/D" if pd.isna(v) else _STORE_NAMES_REPORTE.get(int(v), str(v))
+
+_GOOD_REPORTE = "#158158"
+_WARN_REPORTE = "#ed561b"
+
+
+def _etiqueta_barra(row) -> str:
+    """Categoria + mecanica propuesta - una categoria sola se repite (misma
+    categoria, distinta mecanica), igual que en TopChartsSection.tsx del
+    dashboard."""
+    cat = row.get("CATEGORIA") or "N/D"
+    mecanica = row.get("MECANICA_PLANEADA") or "N/A"
+    return f"{cat} · {mecanica}"
+
+
+def _barras_html(items: list[tuple[str, float]], color: str, fmt) -> str:
+    """Barras horizontales HTML - mismo mark spec que HorizontalBarChart.tsx
+    del dashboard (barra con extremos redondeados, gap entre filas, valor
+    directo al final, etiqueta truncada a la izquierda)."""
+    if not items:
+        return "<p class='nota'>Sin datos.</p>"
+    maximo = max(abs(v) for _, v in items) or 1
+    filas = []
+    for label, valor in items:
+        pct = abs(valor) / maximo * 100
+        filas.append(
+            f'<div class="bar-row">'
+            f'<div class="bar-label" title="{html.escape(label)}">{html.escape(label)}</div>'
+            f'<div class="bar-track"><div class="bar-fill" style="width:{pct:.1f}%;background:{color};"></div></div>'
+            f'<div class="bar-value">{fmt(valor)}</div>'
+            f"</div>"
+        )
+    return f'<div class="bar-chart">{"".join(filas)}</div>'
+
+
+def _top_por(df: pd.DataFrame, campo: str, n: int = 10, asc: bool = False) -> list[tuple[str, float]]:
+    sub = df.dropna(subset=[campo])
+    sub = sub.sort_values(campo, ascending=asc).head(n)
+    return [(_etiqueta_barra(r), r[campo]) for _, r in sub.iterrows()]
+
+
+def _tops_campana_html(performance_df: pd.DataFrame) -> str:
+    """Reproduce TopChartsSection.tsx del dashboard: 4 metricas x 2 tiendas
+    (Atizapan/Coyoacan), cada una con sus top/peores 10."""
+    metricas = [
+        ("Top 10 por GMV", "GMV_TOTAL", False, _GOOD_REPORTE, _fmt_moneda),
+        ("Top 10 por unidades vendidas", "UNIDADES_TOTALES", False, _GOOD_REPORTE, _fmt_num),
+        ("Top 10 por traccion (mejor desempeno)", "TRACCION_SKUS", False, _GOOD_REPORTE, _fmt_ratio),
+        ("Peores 10 por traccion (no funcionaron)", "TRACCION_SKUS", True, _WARN_REPORTE, _fmt_ratio),
+    ]
+    bloques = []
+    for titulo, campo, asc, color, fmt in metricas:
+        columnas_tienda = []
+        for store_id, nombre in _STORE_NAMES_REPORTE.items():
+            items = _top_por(performance_df[performance_df["STORE_ID"] == store_id], campo, 10, asc)
+            columnas_tienda.append(
+                f'<div><p class="chart-subtitle">{html.escape(nombre)}</p>{_barras_html(items, color, fmt)}</div>'
+            )
+        bloques.append(
+            f'<div class="chart-block"><h3>{html.escape(titulo)}</h3>'
+            f'<div class="chart-grid">{"".join(columnas_tienda)}</div></div>'
+        )
+    return "".join(bloques)
+
+
+def _tabla_html(df: pd.DataFrame, columnas: list[tuple[str, str, callable]]) -> str:
+    """Arma un <table> HTML a partir de `df` y una lista de
+    (columna, encabezado, formateador). `html.escape` en celdas de texto -
+    Departamento/Categoria/mecanica son texto libre, no confiar en que
+    nunca traigan '<'/'&'."""
+    encabezados = "".join(f"<th>{html.escape(h)}</th>" for _, h, _ in columnas)
+    filas = []
+    for _, row in df.iterrows():
+        celdas = []
+        for col, _, fmt in columnas:
+            valor = row.get(col)
+            texto = fmt(valor) if fmt else html.escape(str(valor)) if pd.notna(valor) else "N/D"
+            celdas.append(f"<td>{texto}</td>")
+        filas.append(f"<tr>{''.join(celdas)}</tr>")
+    return f"<table><thead><tr>{encabezados}</tr></thead><tbody>{''.join(filas)}</tbody></table>"
+
+
+def generar_reporte_html(
+    performance_df: pd.DataFrame,
+    top_skus_df: pd.DataFrame,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    resumen_df: pd.DataFrame = None,
+    total_planeado: int = None,
+    ruta_salida: str = None,
+    top_n: int = 20,
+) -> str:
+    """Reporte HTML autonomo (mismo sistema de tokens/paleta que las fichas
+    tecnicas hechas a mano durante el proyecto) a partir de los resultados
+    del post-mortem (`performance_por_mecanica`, `top_skus`). Pensado para
+    correr SIEMPRE despues de medir una campana en el notebook, no como un
+    entregable manual aparte.
+
+    `resumen_df` (salida de `resumen_adopcion`) y `total_planeado` (salida de
+    `contar_plan`) son opcionales - si no se pasan, el KPI de Planeado/
+    Adopcion/tarjetas por origen se omite (solo se muestran los KPIs
+    calculables directo de `performance_df`). Se piden por separado, no
+    recalculados aqui adentro, porque `resumen_adopcion` necesita ver TODOS
+    los origenes (incluye 'Sin promo') para el denominador, mientras que
+    `performance_df` ya viene filtrado.
+
+    Nota: `performance_df`/`top_skus_df` ya excluyen 'Sin promo' (ver
+    performance_por_mecanica) y ya traen INGRESO_SUPUESTO_SIN_PROMO/
+    GANANCIA_POR_ESTRATEGIA en NULL para SKUs de peso variable - el reporte
+    no necesita re-aplicar ninguno de esos dos filtros, solo mostrarlos.
+
+    No incluye validacion de redencion (validar_redencion_real) a proposito
+    - se saco del reporte y del dashboard por decision del usuario."""
+    if ruta_salida is None:
+        ruta_salida = (
+            f"data/output/postmortem_{campaign_start.strftime('%b%d').lower()}_"
+            f"{campaign_end.strftime('%b%d').lower()}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.html"
+        )
+
+    gmv_total = performance_df["GMV_TOTAL"].sum() if len(performance_df) else float("nan")
+    ganancia_total = performance_df["GANANCIA_POR_ESTRATEGIA"].sum() if len(performance_df) else float("nan")
+    n_peso_variable = int(performance_df["ES_PESO_VARIABLE"].sum()) if len(performance_df) else 0
+    n_grupos = len(performance_df)
+
+    # Mismo calculo que KpiCards.tsx: promedio de TRACCION_SKUS ignorando
+    # nulos/infinitos (un SKU sin historico previo da traccion infinita).
+    traccion_validas = (
+        performance_df["TRACCION_SKUS"].replace([float("inf"), float("-inf")], pd.NA).dropna()
+        if len(performance_df)
+        else pd.Series(dtype=float)
+    )
+    traccion_promedio = traccion_validas.mean() if len(traccion_validas) else float("nan")
+
+    # Adopcion/Planeado/tarjetas por origen: igual que /summary del backend
+    # (routes.py::campaign_summary) - requieren resumen_df/total_planeado
+    # porque performance_df ya excluye 'Sin promo' y no trae el universo
+    # completo planeado (incluye SKUs planeados sin ninguna venta real).
+    adopcion_pct = None
+    if resumen_df is not None and len(resumen_df) and total_planeado:
+        wknd = resumen_df[resumen_df["ORIGEN_CAMPANA"] == "WKND"]
+        if len(wknd):
+            adopcion_pct = round(wknd["SKU_TIENDAS_CON_PROMO_REAL"].iloc[0] / total_planeado * 100, 1)
+
+    origen_cards = ""
+    if resumen_df is not None and len(resumen_df):
+        for _, row in resumen_df[resumen_df["ORIGEN_CAMPANA"] != "Sin promo"].iterrows():
+            origen_cards += (
+                f'<div class="kpi"><div class="label">{html.escape(str(row["ORIGEN_CAMPANA"]))}</div>'
+                f'<div class="value">{_fmt_num(row["SKU_TIENDAS_CON_PROMO_REAL"])} / {_fmt_num(row["SKU_TIENDAS"])}</div></div>'
+            )
+
+    tabla_performance = _tabla_html(
+        performance_df.head(top_n),
+        [
+            ("MECANICA_PLANEADA", "Mecanica propuesta", None),
+            ("MECANICA_EJECUTADA", "Mecanica real", None),
+            ("ORIGEN_CAMPANA", "Origen", None),
+            ("STORE_ID", "Bodega", _fmt_bodega),
+            ("DEPARTAMENTO", "Departamento", None),
+            ("CATEGORIA", "Categoria", None),
+            ("SKUS", "SKUs", _fmt_num),
+            ("UNIDADES_TOTALES", "Unidades (FDS)", _fmt_num),
+            ("GMV_TOTAL", "GMV", _fmt_moneda),
+            ("MARGEN_PROMEDIO", "Margen prom.", _fmt_pct),
+            ("UNIDADES_DIA", "Unidades/dia", _fmt_num),
+            ("HISTORICO_UNIDADES_DIA_SKUS", "Historico (estos SKUs)", _fmt_num_ceil),
+            ("TRACCION_SKUS", "Traccion", _fmt_ratio),
+            ("INGRESO_SUPUESTO_SIN_PROMO", "Ingreso supuesto sin promo", _fmt_moneda),
+            ("GANANCIA_POR_ESTRATEGIA", "Ganancia por estrategia", _fmt_moneda),
+        ],
+    )
+    tabla_top_skus = _tabla_html(
+        top_skus_df.head(top_n),
+        [
+            ("SKU", "SKU", _fmt_num),
+            ("STORE_ID", "Tienda", None),
+            ("DEPARTAMENTO", "Departamento", None),
+            ("CATEGORIA", "Categoria", None),
+            ("MECANICA_EJECUTADA", "Mecanica", None),
+            ("ORIGEN_CAMPANA", "Origen", None),
+            ("UNIDADES_TOTALES", "Unidades", _fmt_num),
+            ("GMV_TOTAL", "GMV", _fmt_moneda),
+        ],
+    )
+    tops_campana_html = _tops_campana_html(performance_df) if len(performance_df) else "<p class='nota'>Sin datos.</p>"
+    # Validacion de redencion (validar_redencion_real) sacada del reporte a
+    # proposito - el usuario aun no la entiende bien del todo. Queda
+    # comentado (no borrado) porque eventualmente se va a volver a meter:
+    #
+    # tabla_redencion = _tabla_html(
+    #     redemption_df,
+    #     [
+    #         ("BULK_STRATEGY", "Estrategia", None),
+    #         ("TIER", "Tier", None),
+    #         ("UNIDADES_TOTALES", "Unidades", _fmt_num),
+    #         ("REDENCION_REAL", "Redencion real", lambda v: _fmt_pct(v * 100) if pd.notna(v) else "N/D"),
+    #         ("REDENCION_SUPUESTA", "Redencion supuesta", lambda v: _fmt_pct(v * 100) if pd.notna(v) else "N/D"),
+    #         ("DIFERENCIA", "Diferencia", lambda v: _fmt_pct(v * 100) if pd.notna(v) else "N/D"),
+    #     ],
+    # )
+    # <section>
+    #   <h2>Validacion de redencion real vs. supuesta</h2>
+    #   <div class="table-wrap">{tabla_redencion}</div>
+    #   <p class="nota">Redencion real desde FACT_FULFILLMENT_LINE (IS_DISCOUNT/IS_BULK_APPLIED) - directional, muestras chicas en algunos tiers.</p>
+    # </section>
+
+    html_doc = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Post-mortem {campaign_start.date()} a {campaign_end.date()}</title>
+<style>
+  :root {{
+    --paper: #f6f7f3; --ink: #16231d; --muted: #56645b; --line: #dbe0d6;
+    --good: #158158; --good-soft: #e4f2ec; --warn: #c8460f; --warn-soft: #fdece3;
+    --card: #ffffff;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --paper: #10160f; --ink: #ecf1ec; --muted: #9fb0a4; --line: #253229;
+      --good: #3ecf90; --good-soft: #163325; --warn: #ff8a5c; --warn-soft: #3a2015;
+      --card: #161d15;
+    }}
+  }}
+  :root[data-theme="dark"] {{
+    --paper: #10160f; --ink: #ecf1ec; --muted: #9fb0a4; --line: #253229;
+    --good: #3ecf90; --good-soft: #163325; --warn: #ff8a5c; --warn-soft: #3a2015; --card: #161d15;
+  }}
+  :root[data-theme="light"] {{
+    --paper: #f6f7f3; --ink: #16231d; --muted: #56645b; --line: #dbe0d6;
+    --good: #158158; --good-soft: #e4f2ec; --warn: #c8460f; --warn-soft: #fdece3; --card: #ffffff;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    background: var(--paper); color: var(--ink);
+    font-family: Arial, Helvetica, sans-serif; font-size: 15px; line-height: 1.55;
+    margin: 0; padding: 3rem 1.5rem 5rem;
+  }}
+  .sheet {{ max-width: 1800px; margin: 0 auto; }}
+  .masthead {{ border-bottom: 2px solid var(--ink); padding-bottom: 1.25rem; margin-bottom: 2rem; }}
+  .masthead .eyebrow {{
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-style: italic; color: var(--muted); font-size: 0.85rem; margin: 0 0 0.35rem;
+  }}
+  h1 {{
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-weight: 400; font-size: 1.9rem; margin: 0; text-wrap: balance;
+  }}
+  .masthead .meta {{ color: var(--muted); font-size: 0.85rem; margin-top: 0.4rem; }}
+  h2 {{
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-weight: 400; font-style: italic; font-size: 1.1rem; color: var(--muted);
+    margin: 0 0 0.9rem;
+  }}
+  section {{ margin-top: 2.5rem; }}
+  .kpis {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1rem; }}
+  @media (max-width: 640px) {{ .kpis {{ grid-template-columns: repeat(2, 1fr); }} }}
+  .kpi {{
+    background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--good);
+    border-radius: 3px; padding: 0.9rem 1rem;
+  }}
+  .kpi .label {{ font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }}
+  .kpi .value {{ font-size: 1.3rem; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 0.3rem; }}
+  .table-wrap {{ overflow-x: auto; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+  th, td {{ text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; white-space: nowrap; }}
+  th {{ font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 700; }}
+  .nota {{ font-size: 0.85rem; color: var(--muted); margin-top: 0.6rem; }}
+  .chart-block + .chart-block {{ margin-top: 2rem; }}
+  .chart-block h3 {{
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-weight: 400; font-style: italic; font-size: 1rem; color: var(--ink); margin: 0 0 0.75rem;
+  }}
+  .chart-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }}
+  @media (max-width: 720px) {{ .chart-grid {{ grid-template-columns: 1fr; }} }}
+  .chart-subtitle {{ font-weight: 700; margin: 0 0 0.5rem; color: var(--ink); }}
+  .bar-chart {{ display: flex; flex-direction: column; gap: 2px; }}
+  .bar-row {{ display: flex; align-items: center; gap: 0.5rem; }}
+  .bar-label {{
+    width: 220px; flex-shrink: 0; font-size: 0.8rem; text-align: right; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; color: var(--ink);
+  }}
+  .bar-track {{ flex: 1; background: var(--line); border-radius: 4px; height: 20px; }}
+  .bar-fill {{ height: 100%; border-radius: 4px; }}
+  .bar-value {{ width: 100px; flex-shrink: 0; font-size: 0.8rem; font-weight: 700; color: var(--ink); }}
+  @media print {{
+    :root, :root[data-theme="light"], :root[data-theme="dark"] {{
+      --paper: #10160f; --ink: #ecf1ec; --muted: #9fb0a4; --line: #253229;
+      --good: #3ecf90; --good-soft: #163325; --warn: #ff8a5c; --warn-soft: #3a2015; --card: #161d15;
+    }}
+    * {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
+    body {{ padding: 0; background: var(--paper) !important; color: var(--ink) !important; }}
+    .sheet {{ max-width: 100%; }}
+  }}
+</style>
+</head>
+<body>
+<div class="sheet">
+  <div class="masthead">
+    <p class="eyebrow">Post-mortem de campana</p>
+    <h1>{campaign_start.date()} a {campaign_end.date()}</h1>
+    <p class="meta">Generado {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')} · Tiendas 9 (Atizapan) y 14 (Coyoacan)</p>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">Planeado</div><div class="value">{_fmt_num(total_planeado) if total_planeado is not None else "N/D"}</div></div>
+    <div class="kpi"><div class="label">Adopcion</div><div class="value">{f"{adopcion_pct}%" if adopcion_pct is not None else "N/D"}</div></div>
+    <div class="kpi"><div class="label">GMV total (con campana)</div><div class="value">{_fmt_moneda(gmv_total)}</div></div>
+    <div class="kpi"><div class="label">Ganancia por estrategia</div><div class="value">{_fmt_moneda(ganancia_total)}</div></div>
+    <div class="kpi"><div class="label">Traccion promedio</div><div class="value">{_fmt_ratio(traccion_promedio)}</div></div>
+    <div class="kpi"><div class="label">Grupos mecanica x categoria</div><div class="value">{n_grupos}</div></div>
+    <!-- Grupos de peso variable sacado del KPI grid a proposito (pedido del
+         usuario) - se mantiene la variable n_peso_variable porque la nota de
+         abajo la sigue usando para explicar los N/D en la tabla.
+    <div class="kpi"><div class="label">Grupos de peso variable (N/D)</div><div class="value">{n_peso_variable}</div></div>
+    -->
+    {origen_cards}
+  </div>
+  <!-- Nota de "Sin promo"/peso variable sacada del visual a proposito (pedido
+       del usuario, mismo criterio que el KPI de peso variable de arriba).
+  <p class="nota">"Sin promo" (sin oferta propuesta ni ejecutada) se excluye siempre de este reporte - no es relevante para un post-mortem de campana. {n_peso_variable} grupo(s) de peso variable tienen Ganancia por estrategia en N/D (precio en $/kg no comparable contra unidades en piezas).</p>
+  -->
+
+  <section>
+    <h2>Performance por mecanica (top {top_n} por GMV)</h2>
+    <div class="table-wrap">{tabla_performance}</div>
+  </section>
+
+  <section>
+    <h2>Tops de la campana</h2>
+    {tops_campana_html}
+  </section>
+
+  <section>
+    <h2>SKUs mas vendidos (top {top_n})</h2>
+    <div class="table-wrap">{tabla_top_skus}</div>
+  </section>
+
+  <!-- Validacion de redencion sacada a proposito (ver comentario arriba de
+       html_doc) - no eliminada, el usuario aun no la entiende del todo pero
+       eventualmente vuelve a entrar. -->
+</div>
+</body>
+</html>
+"""
+
+    Path(ruta_salida).parent.mkdir(parents=True, exist_ok=True)
+    Path(ruta_salida).write_text(html_doc, encoding="utf-8")
+    return ruta_salida

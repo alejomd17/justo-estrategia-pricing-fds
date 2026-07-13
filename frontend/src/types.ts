@@ -35,18 +35,6 @@ export interface MechanicRow {
   GANANCIA_POR_ESTRATEGIA: number | null
 }
 
-export interface RedemptionRow {
-  BULK_STRATEGY: string | null
-  BULK_RULE_BUY: number | null
-  BULK_RULE_PAY: number | null
-  UNIDADES_TOTALES: number
-  UNIDADES_CON_DESCUENTO: number
-  TIER: string | null
-  REDENCION_REAL: number | null
-  REDENCION_SUPUESTA: number | null
-  DIFERENCIA: number | null
-}
-
 export interface TopSkuRow {
   SKU: number
   STORE_ID: number
