@@ -10,11 +10,21 @@ SKUs elegibles del universo de oportunidad.xlsx), esta consulta trae el
 catalogo completo - es justo lo opuesto a quedarse en ese universo limitado.
 """
 
+import time
+
 import pandas as pd
 
 from . import catalog
 
 MIN_SKU_TIENDAS_POR_CATEGORIA = 5
+
+# Cache en memoria: la query escanea MASTER_ORDERLINE completo desde
+# ventana_inicio y el resultado NO depende de los filtros del dashboard -
+# performance_por_mecanica la llamaba de nuevo en cada request (la causa
+# principal, junto con get_medida_variable, de la lentitud al filtrar).
+# Keyed por ventana para no mezclar ventanas distintas.
+_BASELINE_CACHE = {"key": None, "ts": 0.0, "df": None}
+_CACHE_TTL_SEGUNDOS = 900  # 15 min
 
 
 def _baseline_y_fuente(row, baseline_tienda, conteo_tienda, baseline_cat):
@@ -64,10 +74,22 @@ def get_baseline_categoria(cur, ventana_inicio="2026-01-01", ventana_fin=None) -
     Devuelve un DataFrame a grano SKU+STORE_ID; para consumo a nivel
     Categoria (ej. en postmortem.py), dedup por (Categoria, STORE_ID) o por
     Categoria segun se necesite.
+
+    Cacheado en memoria por _CACHE_TTL_SEGUNDOS (keyed por ventana) - el
+    baseline historico no cambia entre dos clics de filtro del dashboard.
     """
     ventana_inicio = pd.Timestamp(ventana_inicio)
     ventana_fin = pd.Timestamp(ventana_fin) if ventana_fin is not None else pd.Timestamp.now().normalize()
     dias_periodo = (ventana_fin - ventana_inicio).days
+
+    cache_key = (ventana_inicio.date(), ventana_fin.date())
+    ahora = time.monotonic()
+    if (
+        _BASELINE_CACHE["df"] is not None
+        and _BASELINE_CACHE["key"] == cache_key
+        and ahora - _BASELINE_CACHE["ts"] < _CACHE_TTL_SEGUNDOS
+    ):
+        return _BASELINE_CACHE["df"].copy()
 
     cur.execute(
         """
@@ -103,7 +125,7 @@ def get_baseline_categoria(cur, ventana_inicio="2026-01-01", ventana_fin=None) -
     ventas["UNIDADES_DIA_CATEGORIA_TOTAL"], _ = _agregado_con_cascada(ventas, "sum")
     ventas["DIAS_ENTRE_VENTA_CATEGORIA_BASELINE"] = 1 / ventas["UNIDADES_DIA_CATEGORIA_BASELINE"]
 
-    return ventas[
+    resultado = ventas[
         [
             "SKU",
             "STORE_ID",
@@ -116,3 +138,6 @@ def get_baseline_categoria(cur, ventana_inicio="2026-01-01", ventana_fin=None) -
             "FUENTE_BASELINE_CATEGORIA",
         ]
     ]
+    _BASELINE_CACHE.update(key=cache_key, ts=ahora, df=resultado)
+    # .copy() para que ningun caller mute el DataFrame cacheado
+    return resultado.copy()

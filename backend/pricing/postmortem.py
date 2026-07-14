@@ -9,6 +9,8 @@ MX_JUSTO_PROD.SANDBOX definidos en el plan (ver
 - WKND_PLAN_VS_ACTUAL_V (VIEW): join de las dos anteriores + ORIGEN_CAMPANA.
 - WKND_POSTMORTEM_PROMO_V (VIEW): insights agregados (performance por mecanica,
   top ganadores/perdedores, oportunidades de subir precio).
+- WKND_POSTMORTEM_PROMO_T (TABLE): materializacion de la vista anterior (ver
+  materializar_postmortem) - lo que consultan el dashboard y el notebook.
 
 COST/MARGIN/FINAL_PRICE se traen de PRICE_JUSTO_MS_HISTORY (ver
 crear_postmortem_promo_v) - no de VW_PRICING_DASHBOARD, que no daba
@@ -25,6 +27,13 @@ from . import catalog, rotacion
 from .strategy import REDENCION
 
 SCHEMA = "MX_JUSTO_PROD.SANDBOX"
+
+# Materializacion de WKND_POSTMORTEM_PROMO_V (ver materializar_postmortem):
+# la vista encadena joins pesados que Snowflake recalculaba en CADA query
+# del dashboard (~11 por cambio de filtro). Todas las funciones de LECTURA
+# consultan esta tabla; la vista sigue siendo la definicion canonica y solo
+# se consulta al materializar.
+TABLA_POSTMORTEM = f"{SCHEMA}.WKND_POSTMORTEM_PROMO_T"
 
 
 def _tier_redencion(bulk_rule_buy, bulk_rule_pay):
@@ -75,6 +84,27 @@ def crear_fds_promo_results_v(cur) -> None:
     era 8-9). El QUALIFY se queda con una sola campana por SKU+tienda+dia,
     prefiriendo una mecanica reconocida sobre 'Sin dato' y, entre esas, la de
     ventana mas angosta (mas especifica que una campana comercial generica).
+
+    MARKETPLACE/SEGMENTO_USUARIO (agregado 2026-07-13): MASTER_ORDERLINE ya
+    trae MARKETPLACE directo en la linea (justo/express/uber/rappi/didi,
+    confirmado en vivo) - sin join. SEGMENTO_USUARIO (clasificacion OFICIAL
+    de Justo: Recurrente/Reactivado/New, o 'Sin dato' si viene NULL/vacio -
+    confirmado ~37% en blanco en la ventana 10-12 jul, causa no confirmada)
+    sale de MASTER_ORDER.USER_STATUS_ORDER_DELIVERED via LEFT JOIN por
+    ORDER_ID (ambas tablas lo tienen, join limpio 1 orden : N lineas, sin
+    fan-out del lado de MASTER_ORDER).
+
+    USER_ID (agregado 2026-07-14): tambien directo de MASTER_ORDERLINE, sin
+    join extra - necesario para contar usuarios DISTINTOS por segmento
+    (resumen_usuarios_por_segmento), no solo GMV/unidades agregados.
+
+    Estas 3 columnas nuevas vuelven el grano de VENTAS mas fino
+    (SKU+STORE_ID+FECHA+MARKETPLACE+SEGMENTO_USUARIO+USER_ID en vez de
+    SKU+STORE_ID+FECHA) - el QUALIFY de abajo tiene que particionar tambien
+    por ellas, si no colapsa de vuelta a la granularidad vieja y se pierde
+    silenciosamente. Funciones que NO agrupan por estas columnas
+    (performance_por_mecanica, top_skus) no se ven afectadas: es solo una
+    particion mas fina de la misma suma.
     """
     cur.execute(f"""
         CREATE OR REPLACE VIEW {SCHEMA}.WKND_PROMO_RESULTS_V AS
@@ -105,22 +135,30 @@ def crear_fds_promo_results_v(cur) -> None:
         ),
         VENTAS AS (
             SELECT
-                PRODUCT_ID::VARCHAR                     AS SKU,
-                STORE_ID,
-                TO_DATE(DATETIME_DELIVERY)               AS FECHA,
-                SUM(QUANTITY_FULFILLED_PZ)               AS UNIDADES,
-                SUM(AMOUNT_GROSS_DELIVERED)               AS GMV
-            FROM MX_JUSTO_PROD.DR_MASTER_TABLES.MASTER_ORDERLINE
-            WHERE STATUS_ORDER          = 'delivered'
-              AND STORE_ID              IN (9, 14)
-              AND QUANTITY_FULFILLED_PZ > 0
-              AND DATETIME_DELIVERY     >= '2025-01-01'
-            GROUP BY 1, 2, 3
+                ml.PRODUCT_ID::VARCHAR                   AS SKU,
+                ml.STORE_ID                              AS STORE_ID,
+                TO_DATE(ml.DATETIME_DELIVERY)             AS FECHA,
+                ml.MARKETPLACE                            AS MARKETPLACE,
+                COALESCE(NULLIF(mo.USER_STATUS_ORDER_DELIVERED, ''), 'Sin dato') AS SEGMENTO_USUARIO,
+                ml.USER_ID                                AS USER_ID,
+                SUM(ml.QUANTITY_FULFILLED_PZ)             AS UNIDADES,
+                SUM(ml.AMOUNT_GROSS_DELIVERED)            AS GMV
+            FROM MX_JUSTO_PROD.DR_MASTER_TABLES.MASTER_ORDERLINE ml
+            LEFT JOIN MX_JUSTO_PROD.DR_MASTER_TABLES.MASTER_ORDER mo
+                ON ml.ORDER_ID = mo.ORDER_ID
+            WHERE ml.STATUS_ORDER          = 'delivered'
+              AND ml.STORE_ID              IN (9, 14)
+              AND ml.QUANTITY_FULFILLED_PZ > 0
+              AND ml.DATETIME_DELIVERY     >= '2025-01-01'
+            GROUP BY 1, 2, 3, 4, 5, 6
         )
         SELECT
             v.SKU,
             v.STORE_ID,
             v.FECHA,
+            v.MARKETPLACE,
+            v.SEGMENTO_USUARIO,
+            v.USER_ID,
             v.UNIDADES,
             v.GMV,
             c.START_DATE  AS CAMPANA_INICIO,
@@ -135,7 +173,7 @@ def crear_fds_promo_results_v(cur) -> None:
            AND v.STORE_ID = c.STORE_ID
            AND v.FECHA BETWEEN c.START_DATE AND c.END_DATE
         QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY v.SKU, v.STORE_ID, v.FECHA
+            PARTITION BY v.SKU, v.STORE_ID, v.FECHA, v.MARKETPLACE, v.SEGMENTO_USUARIO, v.USER_ID
             ORDER BY
                 CASE WHEN c.MECANICA = 'Sin dato' THEN 1 ELSE 0 END,
                 DATEDIFF(day, c.START_DATE, c.END_DATE) ASC,
@@ -233,6 +271,9 @@ def crear_fds_plan_vs_actual_v(cur) -> None:
             p.GMV_PROYECTADO,
             p.UTIL_PROYECTADA,
             r.FECHA,
+            r.MARKETPLACE,
+            r.SEGMENTO_USUARIO,
+            r.USER_ID,
             r.UNIDADES,
             r.GMV,
             r.MECANICA        AS MECANICA_EJECUTADA,
@@ -313,6 +354,9 @@ def crear_postmortem_promo_v(cur) -> None:
             pva.CAMPAIGN_START,
             pva.CAMPAIGN_END,
             pva.FECHA,
+            pva.MARKETPLACE,
+            pva.SEGMENTO_USUARIO,
+            pva.USER_ID,
             pva.MECANICA_PLANEADA,
             pva.MECANICA_EJECUTADA,
             pva.ORIGEN_CAMPANA,
@@ -335,14 +379,25 @@ def crear_postmortem_promo_v(cur) -> None:
     """)
 
 
-def _filtros_departamento_categoria_tienda(departamento=None, categoria=None, store_id=None, origen=None, adopcion=None):
-    """Cláusulas/params opcionales compartidas por performance_por_mecanica,
-    resumen_adopcion y top_skus - mismo patrón de condición armada en Python
-    que ya usa catalog.get_pricing_dashboard con su parametro `skus`.
+def _filtros_departamento_categoria_tienda(
+    departamento=None, categoria=None, store_id=None, origen=None, adopcion=None,
+    marketplace=None, segmento_usuario=None, mecanica=None,
+):
+    """Cláusulas/params opcionales compartidas por todas las funciones de
+    resumen (performance_por_mecanica, resumen_adopcion, top_skus,
+    resumen_por_marketplace/segmento_usuario, los 4 cruces categoria/
+    departamento x plataforma/segmento, resumen_usuarios_por_segmento,
+    resumen_descuento_plataforma_segmento) - mismo patrón de condición
+    armada en Python que ya usa catalog.get_pricing_dashboard con su
+    parametro `skus`.
+
     `origen` filtra por ORIGEN_CAMPANA ('WKND' / 'Otra fuente' / 'Sin promo').
     `adopcion` filtra por si hubo mecanica real cargada o no ('con_mecanica'
     / 'sin_mecanica') - responde 'lo propusimos en WKND pero, ¿lo
-    adoptaron?'."""
+    adoptaron?'. `marketplace`/`segmento_usuario`/`mecanica` son los 3
+    filtros globales agregados 2026-07-14 (plataforma/tipo de cliente/
+    mecanica real) - `mecanica` filtra por MECANICA_EJECUTADA (la real, no
+    la planeada, de ahi el nombre corto)."""
     condiciones = []
     params = []
     if departamento:
@@ -361,6 +416,15 @@ def _filtros_departamento_categoria_tienda(departamento=None, categoria=None, st
         condiciones.append("MECANICA_EJECUTADA IS NOT NULL")
     elif adopcion == "sin_mecanica":
         condiciones.append("MECANICA_EJECUTADA IS NULL")
+    if marketplace:
+        condiciones.append("MARKETPLACE = %s")
+        params.append(marketplace)
+    if segmento_usuario:
+        condiciones.append("SEGMENTO_USUARIO = %s")
+        params.append(segmento_usuario)
+    if mecanica:
+        condiciones.append("MECANICA_EJECUTADA = %s")
+        params.append(mecanica)
     return condiciones, params
 
 
@@ -373,6 +437,9 @@ def performance_por_mecanica(
     store_id=None,
     origen=None,
     adopcion=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
 ) -> pd.DataFrame:
     """GMV/unidades/margen promedio por mecanica planeada vs. ejecutada,
     ORIGEN_CAMPANA, Departamento, Categoria y tienda, para la ventana dada -
@@ -434,7 +501,8 @@ def performance_por_mecanica(
     "perdida" de -$723k que en realidad era el mismatch de unidad, no un
     resultado real de negocio)."""
     condiciones, params_filtro = _filtros_departamento_categoria_tienda(
-        departamento, categoria, store_id, origen, adopcion=None
+        departamento, categoria, store_id, origen, adopcion=None,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
     )
     condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
     where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
@@ -452,7 +520,7 @@ def performance_por_mecanica(
             SUM(GMV) AS GMV_TOTAL,
             AVG(MARGIN) AS MARGEN_PROMEDIO,
             AVG(FINAL_PRICE) AS PRECIO_PROMEDIO
-        FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
+        FROM {TABLA_POSTMORTEM}
         WHERE {where_clause}
         GROUP BY SKU, STORE_ID, MECANICA_PLANEADA, MECANICA_EJECUTADA, ORIGEN_CAMPANA, DEPARTAMENTO, CATEGORIA
         """,
@@ -574,6 +642,20 @@ def listar_campanas(cur) -> pd.DataFrame:
     return pd.DataFrame(cur.fetchall(), columns=columnas)
 
 
+def listar_mecanicas(cur) -> list:
+    """MECANICA_EJECUTADA distintas ya vistas - para poblar el filtro
+    global de 'Mecanica (real)' del dashboard. Lee la tabla materializada
+    (no la vista WKND_PROMO_RESULTS_V, que re-computa los joins pesados
+    sobre todo el historico solo para un DISTINCT)."""
+    cur.execute(f"""
+        SELECT DISTINCT MECANICA_EJECUTADA
+        FROM {TABLA_POSTMORTEM}
+        WHERE MECANICA_EJECUTADA IS NOT NULL AND MECANICA_EJECUTADA != 'Sin dato'
+        ORDER BY MECANICA_EJECUTADA
+    """)
+    return [r[0] for r in cur.fetchall()]
+
+
 def resumen_adopcion(
     cur,
     campaign_start: pd.Timestamp,
@@ -581,6 +663,9 @@ def resumen_adopcion(
     departamento=None,
     categoria=None,
     store_id=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
 ) -> pd.DataFrame:
     """SKU-tienda distintos por ORIGEN_CAMPANA en la ventana, y de esos
     cuantos tuvieron venta con promo real (CON_PROMO). Consulta
@@ -591,7 +676,10 @@ def resumen_adopcion(
     original solo existen del lado de WKND_PROMO_RESULTS_V (es decir, 'Otra
     fuente' y 'Sin promo') - filtrar por esas columnas dejaria esos dos
     buckets siempre vacios."""
-    condiciones, params_filtro = _filtros_departamento_categoria_tienda(departamento, categoria, store_id)
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
+    )
     where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
     cur.execute(
         f"""
@@ -599,7 +687,7 @@ def resumen_adopcion(
             ORIGEN_CAMPANA,
             COUNT(DISTINCT SKU || '-' || STORE_ID) AS SKU_TIENDAS,
             COUNT(DISTINCT CASE WHEN CON_PROMO THEN SKU || '-' || STORE_ID END) AS SKU_TIENDAS_CON_PROMO_REAL
-        FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
+        FROM {TABLA_POSTMORTEM}
         WHERE {where_clause}
         GROUP BY ORIGEN_CAMPANA
         ORDER BY SKU_TIENDAS DESC
@@ -608,6 +696,432 @@ def resumen_adopcion(
     )
     columnas = [c[0] for c in cur.description]
     return pd.DataFrame(cur.fetchall(), columns=columnas)
+
+
+def resumen_por_marketplace(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+    origen=None,
+    adopcion=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
+) -> pd.DataFrame:
+    """Performance de la campana por plataforma (MARKETPLACE:
+    justo/express/uber/rappi/didi - MASTER_ORDERLINE.MARKETPLACE, directo en
+    la linea, confirmado en vivo). Responde '¿en que plataforma funciono
+    mejor la campana?'. Mismo criterio que performance_por_mecanica: excluye
+    ORIGEN_CAMPANA='Sin promo' siempre (post-mortem de CAMPAÑA, no reporte de
+    ventas general).
+
+    A diferencia de performance_por_mecanica, NO colapsa por SKU antes de
+    aplicar `adopcion` - MARKETPLACE/SEGMENTO_USUARIO son atributos reales de
+    cada venta (no una asignacion que varie dia a dia para el mismo SKU como
+    MECANICA_EJECUTADA), asi que un GROUP BY directo sobre la vista ya
+    refleja la suma real sin riesgo de fragmentar el total de un SKU."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
+    )
+    condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
+    cur.execute(
+        f"""
+        SELECT
+            MARKETPLACE,
+            COUNT(DISTINCT SKU) AS SKUS,
+            SUM(UNIDADES) AS UNIDADES_TOTALES,
+            SUM(GMV) AS GMV_TOTAL,
+            AVG(MARGIN) AS MARGEN_PROMEDIO
+        FROM {TABLA_POSTMORTEM}
+        WHERE {where_clause}
+        GROUP BY MARKETPLACE
+        ORDER BY GMV_TOTAL DESC
+        """,
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["MARGEN_PROMEDIO"] = df["MARGEN_PROMEDIO"].astype(float)
+    df["TICKET_POR_UNIDAD"] = df["GMV_TOTAL"] / df["UNIDADES_TOTALES"]
+    return df
+
+
+def resumen_por_segmento_usuario(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+    origen=None,
+    adopcion=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
+) -> pd.DataFrame:
+    """Performance de la campana por SEGMENTO_USUARIO - clasificacion
+    OFICIAL de Justo (MASTER_ORDER.USER_STATUS_ORDER_DELIVERED, via
+    crear_fds_promo_results_v): 'Recurrente'/'Reactivado'/'New', o 'Sin dato'
+    si venia NULL/vacio. Responde '¿la campana funciono mejor en
+    recurrentes o en reactivados?'. Mismo criterio que
+    performance_por_mecanica: excluye ORIGEN_CAMPANA='Sin promo' siempre.
+
+    'Sin dato' (~37% de las ordenes en la ventana 10-12 jul, tiendas 9/14 -
+    causa no confirmada, no explicada solo por marketplace externo, ver
+    skill justo-snowflake-context) no se descarta - se muestra como una fila
+    mas de la tabla, no oculta el resto de la comparacion."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
+    )
+    condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
+    cur.execute(
+        f"""
+        SELECT
+            SEGMENTO_USUARIO,
+            COUNT(DISTINCT SKU) AS SKUS,
+            SUM(UNIDADES) AS UNIDADES_TOTALES,
+            SUM(GMV) AS GMV_TOTAL,
+            AVG(MARGIN) AS MARGEN_PROMEDIO
+        FROM {TABLA_POSTMORTEM}
+        WHERE {where_clause}
+        GROUP BY SEGMENTO_USUARIO
+        ORDER BY GMV_TOTAL DESC
+        """,
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["MARGEN_PROMEDIO"] = df["MARGEN_PROMEDIO"].astype(float)
+    df["TICKET_POR_UNIDAD"] = df["GMV_TOTAL"] / df["UNIDADES_TOTALES"]
+    return df
+
+
+def _resumen_por_dimension(performance_df: pd.DataFrame, columna: str) -> pd.DataFrame:
+    """Rollup puro pandas (sin cur) de la salida de performance_por_mecanica
+    a nivel `columna` (CATEGORIA o DEPARTAMENTO) - no re-consulta Snowflake,
+    solo re-agrega lo que performance_por_mecanica ya trajo. SKUS se suma
+    (no nunique) porque performance_por_mecanica ya cuenta SKU-tienda por
+    grupo - sumar aqui preserva ese mismo criterio (un SKU vendido en 2
+    tiendas cuenta 2 veces, igual que en resumen_adopcion).
+
+    MARGEN_PROMEDIO se recalcula ponderado por GMV (no un promedio simple
+    de promedios) - una categoria con una mecanica de $50k GMV y otra de
+    $500 no deberia pesar igual en el margen combinado.
+
+    TICKET_POR_UNIDAD = GMV_TOTAL / UNIDADES_TOTALES - precio promedio
+    realizado por unidad vendida, para comparar entre categorias/
+    departamentos sin que el tamano del grupo distorsione la lectura."""
+    if not len(performance_df):
+        return performance_df
+    df = performance_df.copy()
+    df["_GMV_X_MARGEN"] = df["GMV_TOTAL"] * df["MARGEN_PROMEDIO"]
+    agg = (
+        df.groupby(columna, dropna=False)
+        .agg(
+            SKUS=("SKUS", "sum"),
+            UNIDADES_TOTALES=("UNIDADES_TOTALES", "sum"),
+            GMV_TOTAL=("GMV_TOTAL", "sum"),
+            _GMV_X_MARGEN=("_GMV_X_MARGEN", "sum"),
+        )
+        .reset_index()
+    )
+    agg["MARGEN_PROMEDIO"] = agg["_GMV_X_MARGEN"] / agg["GMV_TOTAL"]
+    agg["TICKET_POR_UNIDAD"] = agg["GMV_TOTAL"] / agg["UNIDADES_TOTALES"]
+    return agg.drop(columns="_GMV_X_MARGEN").sort_values("GMV_TOTAL", ascending=False)
+
+
+def resumen_por_categoria(performance_df: pd.DataFrame) -> pd.DataFrame:
+    """Rollup de performance_por_mecanica a nivel Categoria - GMV, unidades,
+    SKUs, margen ponderado por GMV y ticket por unidad. Ver
+    `_resumen_por_dimension` para el detalle de cada calculo."""
+    return _resumen_por_dimension(performance_df, "CATEGORIA")
+
+
+def resumen_por_departamento(performance_df: pd.DataFrame) -> pd.DataFrame:
+    """Rollup de performance_por_mecanica a nivel Departamento - mismo
+    calculo que resumen_por_categoria, un nivel mas arriba en la
+    jerarquia."""
+    return _resumen_por_dimension(performance_df, "DEPARTAMENTO")
+
+
+def resumen_por_plataforma_y_segmento(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+    origen=None,
+    adopcion=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
+) -> pd.DataFrame:
+    """Cruce MARKETPLACE x SEGMENTO_USUARIO - responde si 'Sin dato' en
+    tipo de cliente es en realidad marketplace externo (Justo no puede
+    clasificar el usuario final de ordenes via Uber/Rappi/Didi, a
+    diferencia de justo/express que si tienen la clasificacion oficial
+    casi siempre poblada). Mismo criterio que performance_por_mecanica:
+    excluye ORIGEN_CAMPANA='Sin promo' siempre."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
+    )
+    condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
+    cur.execute(
+        f"""
+        SELECT
+            MARKETPLACE,
+            SEGMENTO_USUARIO,
+            COUNT(DISTINCT SKU) AS SKUS,
+            SUM(UNIDADES) AS UNIDADES_TOTALES,
+            SUM(GMV) AS GMV_TOTAL,
+            AVG(MARGIN) AS MARGEN_PROMEDIO
+        FROM {TABLA_POSTMORTEM}
+        WHERE {where_clause}
+        GROUP BY MARKETPLACE, SEGMENTO_USUARIO
+        ORDER BY MARKETPLACE, GMV_TOTAL DESC
+        """,
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["MARGEN_PROMEDIO"] = df["MARGEN_PROMEDIO"].astype(float)
+    return df
+
+
+def resumen_usuarios_por_segmento(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+    origen=None,
+    adopcion=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
+) -> pd.DataFrame:
+    """Usuarios DISTINTOS por SEGMENTO_USUARIO (no solo GMV/unidades
+    agregados, que pueden estar concentrados en pocos usuarios) y ticket
+    promedio POR USUARIO (GMV_TOTAL / N_USUARIOS - distinto de
+    TICKET_POR_UNIDAD, que es GMV/unidades). Responde '¿cuanta GENTE
+    distinta hay en cada segmento?', el dato que faltaba para poder decir
+    si la campana funciono mejor en un segmento que en otro (comparar GMV
+    total entre segmentos esta sesgado por el tamano de cada grupo).
+
+    Requiere USER_ID (agregado a WKND_PROMO_RESULTS_V el 2026-07-14) - si
+    corres esto contra una vista creada antes de esa fecha, USER_ID no
+    existe todavia; correr crear_objetos_postmortem o subir_plan_y_crear_vistas
+    de nuevo para recrear la vista con la columna."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
+    )
+    condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
+    cur.execute(
+        f"""
+        SELECT
+            SEGMENTO_USUARIO,
+            COUNT(DISTINCT USER_ID) AS USUARIOS_DISTINTOS,
+            SUM(GMV) AS GMV_TOTAL
+        FROM {TABLA_POSTMORTEM}
+        WHERE {where_clause}
+        GROUP BY SEGMENTO_USUARIO
+        ORDER BY GMV_TOTAL DESC
+        """,
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["TICKET_PROMEDIO_USUARIO"] = df["GMV_TOTAL"] / df["USUARIOS_DISTINTOS"]
+    return df
+
+
+def resumen_descuento_plataforma_segmento(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+    origen=None,
+    adopcion=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
+) -> pd.DataFrame:
+    """Cruce de 3 dimensiones - MECANICA_EJECUTADA x MARKETPLACE x
+    SEGMENTO_USUARIO - GMV/margen/unidades. Tabla granular a proposito (no
+    grafica): responde preguntas puntuales tipo '¿el 5x4 en Uber le fue
+    mejor a Recurrentes o a Nuevos?' filtrando/ordenando la tabla, no un
+    resumen ya decidido de antemano. Mismo criterio que
+    performance_por_mecanica: excluye ORIGEN_CAMPANA='Sin promo' siempre."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
+    )
+    condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
+    cur.execute(
+        f"""
+        SELECT
+            MECANICA_EJECUTADA,
+            MARKETPLACE,
+            SEGMENTO_USUARIO,
+            COUNT(DISTINCT SKU) AS SKUS,
+            SUM(UNIDADES) AS UNIDADES_TOTALES,
+            SUM(GMV) AS GMV_TOTAL,
+            AVG(MARGIN) AS MARGEN_PROMEDIO
+        FROM {TABLA_POSTMORTEM}
+        WHERE {where_clause}
+        GROUP BY MECANICA_EJECUTADA, MARKETPLACE, SEGMENTO_USUARIO
+        ORDER BY GMV_TOTAL DESC
+        """,
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["MARGEN_PROMEDIO"] = df["MARGEN_PROMEDIO"].astype(float)
+    return df
+
+
+def _resumen_por_dos_dimensiones(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    col1: str,
+    col2: str,
+    departamento=None,
+    categoria=None,
+    store_id=None,
+    origen=None,
+    adopcion=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
+) -> pd.DataFrame:
+    """Base compartida de los 4 cruces categoria/departamento x
+    plataforma/segmento - mismo shape que resumen_descuento_plataforma_segmento
+    pero con 2 dimensiones en vez de 3, mas TICKET_POR_UNIDAD calculado
+    despues (GMV/unidades), igual que _resumen_por_dimension. `col1`/`col2`
+    son nombres de columna literales (CATEGORIA/DEPARTAMENTO/MARKETPLACE/
+    SEGMENTO_USUARIO) - no vienen del usuario final, no hay riesgo de
+    inyeccion SQL aqui."""
+    condiciones, params_filtro = _filtros_departamento_categoria_tienda(
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
+    )
+    condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
+    cur.execute(
+        f"""
+        SELECT
+            {col1},
+            {col2},
+            COUNT(DISTINCT SKU) AS SKUS,
+            SUM(UNIDADES) AS UNIDADES_TOTALES,
+            SUM(GMV) AS GMV_TOTAL,
+            AVG(MARGIN) AS MARGEN_PROMEDIO
+        FROM {TABLA_POSTMORTEM}
+        WHERE {where_clause}
+        GROUP BY {col1}, {col2}
+        ORDER BY GMV_TOTAL DESC
+        """,
+        [campaign_start.date(), campaign_end.date()] + params_filtro,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["MARGEN_PROMEDIO"] = df["MARGEN_PROMEDIO"].astype(float)
+    df["TICKET_POR_UNIDAD"] = df["GMV_TOTAL"] / df["UNIDADES_TOTALES"]
+    return df
+
+
+def resumen_por_categoria_y_plataforma(
+    cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp,
+    departamento=None, categoria=None, store_id=None, origen=None, adopcion=None,
+    marketplace=None, segmento_usuario=None, mecanica=None,
+) -> pd.DataFrame:
+    """GMV/ticket por unidad/unidades/margen por Categoria x MARKETPLACE -
+    alimenta las barras agrupadas (una serie por plataforma) dentro de la
+    seccion 'Performance por plataforma' - responde si el patron de una
+    categoria se explica por mezcla de plataforma o es parejo en todas."""
+    return _resumen_por_dos_dimensiones(
+        cur, campaign_start, campaign_end, "CATEGORIA", "MARKETPLACE",
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace, segmento_usuario, mecanica,
+    )
+
+
+def resumen_por_departamento_y_plataforma(
+    cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp,
+    departamento=None, categoria=None, store_id=None, origen=None, adopcion=None,
+    marketplace=None, segmento_usuario=None, mecanica=None,
+) -> pd.DataFrame:
+    """Mismo que resumen_por_categoria_y_plataforma, un nivel mas arriba en
+    la jerarquia (Departamento x MARKETPLACE)."""
+    return _resumen_por_dos_dimensiones(
+        cur, campaign_start, campaign_end, "DEPARTAMENTO", "MARKETPLACE",
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace, segmento_usuario, mecanica,
+    )
+
+
+def resumen_por_categoria_y_segmento(
+    cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp,
+    departamento=None, categoria=None, store_id=None, origen=None, adopcion=None,
+    marketplace=None, segmento_usuario=None, mecanica=None,
+) -> pd.DataFrame:
+    """GMV/ticket por unidad/unidades/margen por Categoria x
+    SEGMENTO_USUARIO - alimenta las barras agrupadas (una serie por tipo de
+    cliente) dentro de la seccion 'Performance por tipo de cliente'."""
+    return _resumen_por_dos_dimensiones(
+        cur, campaign_start, campaign_end, "CATEGORIA", "SEGMENTO_USUARIO",
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace, segmento_usuario, mecanica,
+    )
+
+
+def resumen_por_departamento_y_segmento(
+    cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp,
+    departamento=None, categoria=None, store_id=None, origen=None, adopcion=None,
+    marketplace=None, segmento_usuario=None, mecanica=None,
+) -> pd.DataFrame:
+    """Mismo que resumen_por_categoria_y_segmento, un nivel mas arriba en la
+    jerarquia (Departamento x SEGMENTO_USUARIO)."""
+    return _resumen_por_dos_dimensiones(
+        cur, campaign_start, campaign_end, "DEPARTAMENTO", "SEGMENTO_USUARIO",
+        departamento, categoria, store_id, origen, adopcion,
+        marketplace, segmento_usuario, mecanica,
+    )
 
 
 def top_skus(
@@ -620,6 +1134,9 @@ def top_skus(
     store_id=None,
     origen=None,
     adopcion=None,
+    marketplace=None,
+    segmento_usuario=None,
+    mecanica=None,
 ) -> pd.DataFrame:
     """Ranking de SKUs mas vendidos (unidades) en la ventana, con
     Departamento/Categoria/tienda/mecanica/origen y filtros opcionales sobre
@@ -638,7 +1155,8 @@ def top_skus(
     top general de ventas (un SKU sin ninguna oferta propuesta ni ejecutada
     no aporta al post-mortem)."""
     condiciones, params_filtro = _filtros_departamento_categoria_tienda(
-        departamento, categoria, store_id, origen, adopcion=None
+        departamento, categoria, store_id, origen, adopcion=None,
+        marketplace=marketplace, segmento_usuario=segmento_usuario, mecanica=mecanica,
     )
     condiciones.append("ORIGEN_CAMPANA != 'Sin promo'")
     where_clause = " AND ".join(["FECHA BETWEEN %s AND %s"] + condiciones)
@@ -653,7 +1171,7 @@ def top_skus(
             ORIGEN_CAMPANA,
             SUM(UNIDADES) AS UNIDADES_TOTALES,
             SUM(GMV) AS GMV_TOTAL
-        FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V
+        FROM {TABLA_POSTMORTEM}
         WHERE {where_clause}
         GROUP BY SKU, STORE_ID, DEPARTAMENTO, CATEGORIA, MECANICA_EJECUTADA, ORIGEN_CAMPANA
         """,
@@ -730,6 +1248,7 @@ def subir_plan_y_crear_vistas(
     n = subir_plan(cur, estrategia_df, weekend_inicio, weekend_fin, pd.Timestamp.now())
     crear_fds_plan_vs_actual_v(cur)
     crear_postmortem_promo_v(cur)
+    materializar_postmortem(cur)
     return n
 
 
@@ -743,6 +1262,25 @@ def crear_objetos_postmortem(cur) -> None:
     crear_fds_promo_plan_tabla(cur)
     crear_fds_plan_vs_actual_v(cur)
     crear_postmortem_promo_v(cur)
+    materializar_postmortem(cur)
+
+
+def materializar_postmortem(cur) -> None:
+    """Congela WKND_POSTMORTEM_PROMO_V en la tabla WKND_POSTMORTEM_PROMO_T.
+
+    La vista encadena joins pesados (DISCOUNT_CAMPAIGN_EVENT deduplicada x
+    MASTER_ORDERLINE x MASTER_ORDER x PRICE_JUSTO_MS_HISTORY x catalogo) que
+    Snowflake recalculaba en CADA query del dashboard - con ~11 queries por
+    cambio de filtro, esa era la parte lenta que quedaba despues de cachear
+    el baseline/peso variable. Materializar paga el costo UNA vez aqui;
+    todas las funciones de lectura consultan TABLA_POSTMORTEM.
+
+    Trade-off aceptado: la tabla es una FOTO al momento de materializar -
+    ventas que lleguen despues a Snowflake no aparecen hasta re-materializar.
+    Irrelevante para el post-mortem de una campana ya pasada; si se mide una
+    campana EN CURSO, correr esta funcion (o subir_plan_y_crear_vistas, que
+    la incluye) para refrescar."""
+    cur.execute(f"CREATE OR REPLACE TABLE {TABLA_POSTMORTEM} AS SELECT * FROM {SCHEMA}.WKND_POSTMORTEM_PROMO_V")
 
 
 def validar_redencion_real(cur, campaign_start: pd.Timestamp, campaign_end: pd.Timestamp) -> pd.DataFrame:
@@ -876,6 +1414,165 @@ def _tops_campana_html(performance_df: pd.DataFrame) -> str:
     return "".join(bloques)
 
 
+_COLORES_PLATAFORMA_REPORTE = {
+    "justo": "#158158", "express": "#058dc7", "uber": "#ed561b",
+    "rappi": "#24cbe5", "didi": "#64e572",
+}
+
+_COLORES_SEGMENTO_REPORTE = {
+    "Recurrente": "#158158", "Reactivado": "#058dc7", "New": "#ed561b", "Sin dato": "#888888",
+}
+
+
+def _pie_html(items: list[tuple[str, float]], colores: dict, fmt) -> str:
+    """Pastel via CSS conic-gradient (sin JS/libreria) - mismo enfoque que
+    PieChart.tsx del dashboard, para que documento y dashboard se vean
+    iguales."""
+    if not items:
+        return "<p class='nota'>Sin datos.</p>"
+    total = sum(v for _, v in items) or 1
+    acumulado = 0.0
+    stops = []
+    leyenda = []
+    for label, valor in items:
+        inicio = acumulado / total * 100
+        acumulado += valor
+        fin = acumulado / total * 100
+        color = colores.get(label, "#888888")
+        stops.append(f"{color} {inicio:.2f}% {fin:.2f}%")
+        pct = valor / total * 100
+        leyenda.append(
+            f'<div class="pie-legend-row">'
+            f'<span class="pie-swatch" style="background:{color};"></span>'
+            f"<span>{html.escape(label)}</span>"
+            f'<span class="pie-legend-value">{fmt(valor)} ({pct:.1f}%)</span>'
+            f"</div>"
+        )
+    gradiente = ", ".join(stops)
+    return (
+        f'<div class="pie-wrap">'
+        f'<div class="pie" style="background:conic-gradient({gradiente});"></div>'
+        f'<div class="pie-legend">{"".join(leyenda)}</div>'
+        f"</div>"
+    )
+
+
+def _pivot_html(df: pd.DataFrame, index_col: str, columns_col: str, values_col: str, fmt) -> str:
+    """Tabla pivote simple (filas=index_col, columnas=columns_col,
+    celda=fmt(valor)) - no usa pandas.pivot para controlar el formato de
+    celda y el manejo de NaN/'Sin dato' a mano. Filas y columnas ordenadas
+    por su total de `values_col` descendente (no alfabetico - didi con $80
+    no debe salir arriba de justo con $30k)."""
+    if not len(df):
+        return "<p class='nota'>Sin datos.</p>"
+    tmp = df.copy()
+    tmp["_IDX"] = tmp[index_col].fillna("N/D")
+    tmp["_COL"] = tmp[columns_col].fillna("Sin dato")
+    filas_idx = list(tmp.groupby("_IDX")[values_col].sum().sort_values(ascending=False).index)
+    cols_idx = list(tmp.groupby("_COL")[values_col].sum().sort_values(ascending=False).index)
+    mapa = {(r["_IDX"], r["_COL"]): r[values_col] for _, r in tmp.iterrows()}
+    encabezados = "".join(f"<th>{html.escape(str(c))}</th>" for c in cols_idx)
+    filas_html = []
+    for fi in filas_idx:
+        celdas = "".join(f"<td>{fmt(mapa.get((fi, c)))}</td>" for c in cols_idx)
+        filas_html.append(f"<tr><td>{html.escape(str(fi))}</td>{celdas}</tr>")
+    return f"<table><thead><tr><th></th>{encabezados}</tr></thead><tbody>{''.join(filas_html)}</tbody></table>"
+
+
+_GBAR_N_TICKS = 4  # 4 intervalos -> 5 lineas de eje
+
+
+def _paso_bonito_eje(maximo: float) -> float:
+    """Paso "bonito" para el eje Y: redondea maximo/_GBAR_N_TICKS hacia
+    arriba al multiplo 1/1.25/1.5/2/2.5/3/4/5/6/8 x 10^k mas cercano, para
+    ticks redondos ($1,250 / $2,500...) en vez de fracciones crudas del
+    maximo ($4,783 / $3,587...) - espejo de pasoBonito en
+    GroupedBarChart.tsx."""
+    bruto = maximo / _GBAR_N_TICKS
+    pot = 10 ** math.floor(math.log10(bruto)) if bruto > 0 else 1
+    for m in (1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8):
+        if m * pot >= bruto:
+            return m * pot
+    return 10 * pot
+
+
+def _grouped_bar_html(groups: list[tuple[str, list[tuple[str, float]]]], color_map: dict, fmt, default_color: str = "#888888") -> str:
+    """Barras verticales agrupadas (una serie por plataforma/tipo de
+    cliente - color por `color_map`, un grupo por categoria/departamento) -
+    mismo criterio que GroupedBarChart.tsx del dashboard, incluye eje Y con
+    lineas guia + valores (sin esto una barra sola no dice nada - solo
+    comparacion relativa sin escala). `groups` es
+    [(label_grupo, [(label_serie, valor), ...]), ...]. Scroll horizontal
+    via CSS si hay muchos grupos (ej. ~24 categorias) - el eje Y queda
+    fijo, fuera del contenedor con scroll."""
+    if not groups:
+        return "<p class='nota'>Sin datos.</p>"
+    valores = [v for _, bars in groups for _, v in bars]
+    maximo = max((abs(v) for v in valores), default=1) or 1
+    colores_vistos = {}
+    for _, bars in groups:
+        for serie, _ in bars:
+            colores_vistos.setdefault(serie, color_map.get(serie, default_color))
+    leyenda = "".join(
+        f'<span class="gbar-legend-item"><span class="gbar-swatch" style="background:{color};"></span>{html.escape(str(serie))}</span>'
+        for serie, color in colores_vistos.items()
+    )
+
+    paso = _paso_bonito_eje(maximo)
+    top_escala = paso * _GBAR_N_TICKS
+    ticks = [paso * (_GBAR_N_TICKS - i) for i in range(_GBAR_N_TICKS + 1)]
+    eje_y = "".join(f"<span>{fmt(v)}</span>" for v in ticks)
+    lineas_guia = "".join('<div class="gbar-gridline"></div>' for _ in ticks)
+
+    grupos_html = []
+    etiquetas_html = []
+    for label_grupo, bars in groups:
+        barras = "".join(
+            f'<div class="gbar" title="{html.escape(str(label_grupo))} · {html.escape(str(serie))}: {fmt(valor)}" '
+            f'style="height:{abs(valor) / top_escala * 100:.1f}%;background:{color_map.get(serie, default_color)};"></div>'
+            for serie, valor in bars
+        )
+        grupos_html.append(f'<div class="gbar-bars">{barras}</div>')
+        ancho = len(bars) * 16 - 2
+        etiquetas_html.append(
+            f'<div class="gbar-label" style="width:{ancho}px;" title="{html.escape(str(label_grupo))}">{html.escape(str(label_grupo))}</div>'
+        )
+    return (
+        f'<div class="gbar-legend">{leyenda}</div>'
+        f'<div class="gbar-wrap">'
+        f'<div class="gbar-axis">{eje_y}</div>'
+        f'<div class="gbar-scroll"><div class="gbar-inner">'
+        f'<div class="gbar-gridlines">{lineas_guia}</div>'
+        f'<div class="gbar-chart">{"".join(grupos_html)}</div>'
+        f'<div class="gbar-labels">{"".join(etiquetas_html)}</div>'
+        f"</div></div></div>"
+    )
+
+
+def _grid_cruzado_html(df: pd.DataFrame, label_col: str, series_col: str, color_map: dict) -> str:
+    """4 graficas de barras agrupadas (GMV/ticket por unidad/unidades/
+    margen), una serie por `series_col`, un grupo por `label_col` - mismo
+    criterio que CrossDimensionSection.tsx del dashboard."""
+    if df is None or not len(df):
+        return "<p class='nota'>Sin datos.</p>"
+    metricas = [
+        ("GMV", "GMV_TOTAL", _fmt_moneda),
+        ("Ticket por unidad", "TICKET_POR_UNIDAD", _fmt_moneda),
+        ("Unidades", "UNIDADES_TOTALES", _fmt_num),
+        ("Margen", "MARGEN_PROMEDIO", _fmt_pct),
+    ]
+    bloques = []
+    for titulo, campo, fmt in metricas:
+        sub = df.dropna(subset=[campo]).copy()
+        sub["_LABEL"] = sub[label_col].fillna("N/D")
+        sub["_SERIE"] = sub[series_col].fillna("N/D")
+        groups = [(lbl, list(zip(g["_SERIE"], g[campo]))) for lbl, g in sub.groupby("_LABEL", sort=False)]
+        bloques.append(
+            f'<div class="chart-block"><h3>{html.escape(titulo)}</h3>{_grouped_bar_html(groups, color_map, fmt)}</div>'
+        )
+    return f'<div class="chart-grid-cross">{"".join(bloques)}</div>'
+
+
 def _tabla_html(df: pd.DataFrame, columnas: list[tuple[str, str, callable]]) -> str:
     """Arma un <table> HTML a partir de `df` y una lista de
     (columna, encabezado, formateador). `html.escape` en celdas de texto -
@@ -902,6 +1599,17 @@ def generar_reporte_html(
     total_planeado: int = None,
     ruta_salida: str = None,
     top_n: int = 20,
+    marketplace_df: pd.DataFrame = None,
+    segmento_usuario_df: pd.DataFrame = None,
+    categoria_df: pd.DataFrame = None,
+    departamento_df: pd.DataFrame = None,
+    plataforma_segmento_df: pd.DataFrame = None,
+    usuarios_segmento_df: pd.DataFrame = None,
+    descuento_plataforma_segmento_df: pd.DataFrame = None,
+    categoria_plataforma_df: pd.DataFrame = None,
+    departamento_plataforma_df: pd.DataFrame = None,
+    categoria_segmento_df: pd.DataFrame = None,
+    departamento_segmento_df: pd.DataFrame = None,
 ) -> str:
     """Reporte HTML autonomo (mismo sistema de tokens/paleta que las fichas
     tecnicas hechas a mano durante el proyecto) a partir de los resultados
@@ -923,7 +1631,29 @@ def generar_reporte_html(
     no necesita re-aplicar ninguno de esos dos filtros, solo mostrarlos.
 
     No incluye validacion de redencion (validar_redencion_real) a proposito
-    - se saco del reporte y del dashboard por decision del usuario."""
+    - se saco del reporte y del dashboard por decision del usuario.
+
+    `marketplace_df` (salida de `resumen_por_marketplace`) y
+    `segmento_usuario_df` (salida de `resumen_por_segmento_usuario`) son
+    opcionales - si no se pasan, esas 2 secciones se omiten. Mismo criterio
+    que `resumen_df`: se piden ya calculadas, no recalculadas aqui.
+
+    `categoria_df`/`departamento_df` (salida de `resumen_por_categoria`/
+    `resumen_por_departamento`), `plataforma_segmento_df` (salida de
+    `resumen_por_plataforma_y_segmento`), `usuarios_segmento_df` (salida de
+    `resumen_usuarios_por_segmento`) y `descuento_plataforma_segmento_df`
+    (salida de `resumen_descuento_plataforma_segmento`) son igual de
+    opcionales - mismo criterio, se omite la seccion correspondiente si no
+    se pasan.
+
+    `categoria_plataforma_df`/`departamento_plataforma_df` (salida de
+    `resumen_por_categoria_y_plataforma`/`resumen_por_departamento_y_plataforma`)
+    y `categoria_segmento_df`/`departamento_segmento_df` (salida de
+    `resumen_por_categoria_y_segmento`/`resumen_por_departamento_y_segmento`)
+    alimentan las barras agrupadas dentro de las secciones de plataforma/
+    tipo de cliente respectivamente - TODO lo de plataforma vive junto en
+    una sola seccion, TODO lo de tipo de cliente en otra, sin interfolar
+    (pedido explicito del usuario) - mismo orden que App.tsx."""
     if ruta_salida is None:
         ruta_salida = (
             f"data/output/postmortem_{campaign_start.strftime('%b%d').lower()}_"
@@ -996,6 +1726,129 @@ def generar_reporte_html(
         ],
     )
     tops_campana_html = _tops_campana_html(performance_df) if len(performance_df) else "<p class='nota'>Sin datos.</p>"
+
+    tabla_marketplace = pastel_marketplace_gmv = pastel_marketplace_vol = None
+    if marketplace_df is not None and len(marketplace_df):
+        tabla_marketplace = _tabla_html(
+            marketplace_df,
+            [
+                ("MARKETPLACE", "Plataforma", None),
+                ("SKUS", "SKUs", _fmt_num),
+                ("UNIDADES_TOTALES", "Unidades", _fmt_num),
+                ("GMV_TOTAL", "GMV", _fmt_moneda),
+                ("MARGEN_PROMEDIO", "Margen prom.", _fmt_pct),
+            ],
+        )
+        items_gmv = [
+            (r["MARKETPLACE"] if pd.notna(r["MARKETPLACE"]) else "N/D", r["GMV_TOTAL"])
+            for _, r in marketplace_df.sort_values("GMV_TOTAL", ascending=False).iterrows()
+            if pd.notna(r["GMV_TOTAL"])
+        ]
+        items_vol = [
+            (r["MARKETPLACE"] if pd.notna(r["MARKETPLACE"]) else "N/D", r["UNIDADES_TOTALES"])
+            for _, r in marketplace_df.sort_values("UNIDADES_TOTALES", ascending=False).iterrows()
+            if pd.notna(r["UNIDADES_TOTALES"])
+        ]
+        pastel_marketplace_gmv = _pie_html(items_gmv, _COLORES_PLATAFORMA_REPORTE, _fmt_moneda)
+        pastel_marketplace_vol = _pie_html(items_vol, _COLORES_PLATAFORMA_REPORTE, _fmt_num)
+
+    tabla_segmento_usuario = pastel_segmento_gmv = pastel_segmento_vol = None
+    if segmento_usuario_df is not None and len(segmento_usuario_df):
+        tabla_segmento_usuario = _tabla_html(
+            segmento_usuario_df,
+            [
+                ("SEGMENTO_USUARIO", "Tipo de cliente", None),
+                ("SKUS", "SKUs", _fmt_num),
+                ("UNIDADES_TOTALES", "Unidades", _fmt_num),
+                ("GMV_TOTAL", "GMV", _fmt_moneda),
+                ("MARGEN_PROMEDIO", "Margen prom.", _fmt_pct),
+            ],
+        )
+        items_gmv = [
+            (r["SEGMENTO_USUARIO"] if pd.notna(r["SEGMENTO_USUARIO"]) else "Sin dato", r["GMV_TOTAL"])
+            for _, r in segmento_usuario_df.sort_values("GMV_TOTAL", ascending=False).iterrows()
+            if pd.notna(r["GMV_TOTAL"])
+        ]
+        items_vol = [
+            (r["SEGMENTO_USUARIO"] if pd.notna(r["SEGMENTO_USUARIO"]) else "Sin dato", r["UNIDADES_TOTALES"])
+            for _, r in segmento_usuario_df.sort_values("UNIDADES_TOTALES", ascending=False).iterrows()
+            if pd.notna(r["UNIDADES_TOTALES"])
+        ]
+        pastel_segmento_gmv = _pie_html(items_gmv, _COLORES_SEGMENTO_REPORTE, _fmt_moneda)
+        pastel_segmento_vol = _pie_html(items_vol, _COLORES_SEGMENTO_REPORTE, _fmt_num)
+
+    def _grid_metricas_dimension(df: pd.DataFrame, columna: str, campos: set = None) -> str:
+        """Graficas de barra (GMV/ticket por unidad/unidades/margen) para
+        una dimension - mismo criterio que DimensionMetricsSection.tsx del
+        dashboard. `campos` (set de nombres de columna) acota el subconjunto:
+        las secciones de plataforma/tipo de cliente ya muestran GMV/Unidades
+        como pastel, ahi solo se piden las 2 tasas para no duplicar."""
+        if df is None or not len(df):
+            return "<p class='nota'>Sin datos.</p>"
+        metricas = [
+            ("GMV", "GMV_TOTAL", _fmt_moneda),
+            ("Ticket por unidad", "TICKET_POR_UNIDAD", _fmt_moneda),
+            ("Unidades", "UNIDADES_TOTALES", _fmt_num),
+            ("Margen", "MARGEN_PROMEDIO", _fmt_pct),
+        ]
+        if campos:
+            metricas = [m for m in metricas if m[1] in campos]
+        bloques = []
+        for titulo, campo, fmt in metricas:
+            sub = df.dropna(subset=[campo]).sort_values(campo, ascending=False)
+            items = [(r[columna] if pd.notna(r[columna]) else "N/D", r[campo]) for _, r in sub.iterrows()]
+            bloques.append(
+                f'<div class="chart-block"><h3>{html.escape(titulo)}</h3>{_barras_html(items, _GOOD_REPORTE, fmt)}</div>'
+            )
+        return f'<div class="chart-grid">{"".join(bloques)}</div>'
+
+    grid_categoria = _grid_metricas_dimension(categoria_df, "CATEGORIA")
+    grid_departamento = _grid_metricas_dimension(departamento_df, "DEPARTAMENTO")
+    grid_marketplace = _grid_metricas_dimension(
+        marketplace_df, "MARKETPLACE", campos={"TICKET_POR_UNIDAD", "MARGEN_PROMEDIO"}
+    )
+    grid_segmento_usuario = _grid_metricas_dimension(
+        segmento_usuario_df, "SEGMENTO_USUARIO", campos={"TICKET_POR_UNIDAD", "MARGEN_PROMEDIO"}
+    )
+
+    grid_categoria_plataforma = _grid_cruzado_html(categoria_plataforma_df, "CATEGORIA", "MARKETPLACE", _COLORES_PLATAFORMA_REPORTE)
+    grid_departamento_plataforma = _grid_cruzado_html(departamento_plataforma_df, "DEPARTAMENTO", "MARKETPLACE", _COLORES_PLATAFORMA_REPORTE)
+    grid_categoria_segmento = _grid_cruzado_html(categoria_segmento_df, "CATEGORIA", "SEGMENTO_USUARIO", _COLORES_SEGMENTO_REPORTE)
+    grid_departamento_segmento = _grid_cruzado_html(departamento_segmento_df, "DEPARTAMENTO", "SEGMENTO_USUARIO", _COLORES_SEGMENTO_REPORTE)
+
+    tabla_plataforma_segmento = None
+    if plataforma_segmento_df is not None and len(plataforma_segmento_df):
+        tabla_plataforma_segmento = _pivot_html(
+            plataforma_segmento_df, "MARKETPLACE", "SEGMENTO_USUARIO", "GMV_TOTAL", _fmt_moneda
+        )
+
+    tabla_usuarios_segmento = None
+    if usuarios_segmento_df is not None and len(usuarios_segmento_df):
+        tabla_usuarios_segmento = _tabla_html(
+            usuarios_segmento_df,
+            [
+                ("SEGMENTO_USUARIO", "Tipo de cliente", None),
+                ("USUARIOS_DISTINTOS", "Usuarios distintos", _fmt_num),
+                ("GMV_TOTAL", "GMV", _fmt_moneda),
+                ("TICKET_PROMEDIO_USUARIO", "Ticket promedio por usuario", _fmt_moneda),
+            ],
+        )
+
+    tabla_descuento_plataforma_segmento = None
+    if descuento_plataforma_segmento_df is not None and len(descuento_plataforma_segmento_df):
+        tabla_descuento_plataforma_segmento = _tabla_html(
+            descuento_plataforma_segmento_df,
+            [
+                ("MECANICA_EJECUTADA", "Mecanica", None),
+                ("MARKETPLACE", "Plataforma", None),
+                ("SEGMENTO_USUARIO", "Tipo de cliente", None),
+                ("SKUS", "SKUs", _fmt_num),
+                ("UNIDADES_TOTALES", "Unidades", _fmt_num),
+                ("GMV_TOTAL", "GMV", _fmt_moneda),
+                ("MARGEN_PROMEDIO", "Margen prom.", _fmt_pct),
+            ],
+        )
+
     # Validacion de redencion (validar_redencion_real) sacada del reporte a
     # proposito - el usuario aun no la entiende bien del todo. Queda
     # comentado (no borrado) porque eventualmente se va a volver a meter:
@@ -1097,6 +1950,37 @@ def generar_reporte_html(
   .bar-track {{ flex: 1; background: var(--line); border-radius: 4px; height: 20px; }}
   .bar-fill {{ height: 100%; border-radius: 4px; }}
   .bar-value {{ width: 100px; flex-shrink: 0; font-size: 0.8rem; font-weight: 700; color: var(--ink); }}
+  .pie-wrap {{ display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }}
+  .pie {{ width: 180px; height: 180px; border-radius: 50%; flex-shrink: 0; }}
+  .pie-legend {{ display: flex; flex-direction: column; gap: 0.4rem; }}
+  .pie-legend-row {{ display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem; }}
+  .pie-swatch {{ width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }}
+  .pie-legend-value {{ font-weight: 700; color: var(--ink); }}
+  .chart-grid-cross {{ display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }}
+  @media (max-width: 720px) {{ .chart-grid-cross {{ grid-template-columns: 1fr; }} }}
+  .gbar-legend {{ display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.75rem; font-size: 0.8rem; }}
+  .gbar-legend-item {{ display: inline-flex; align-items: center; gap: 0.35rem; margin-right: 0.5rem; }}
+  .gbar-swatch {{ width: 10px; height: 10px; border-radius: 2px; display: inline-block; }}
+  .gbar-wrap {{ display: flex; }}
+  .gbar-axis {{
+    display: flex; flex-direction: column; justify-content: space-between; height: 220px;
+    margin-right: 0.5rem; font-size: 0.7rem; color: var(--ink); text-align: right; flex-shrink: 0;
+  }}
+  .gbar-scroll {{ overflow-x: auto; flex: 1; }}
+  .gbar-inner {{ position: relative; min-width: fit-content; }}
+  .gbar-gridlines {{
+    position: absolute; inset: 0; height: 220px; display: flex; flex-direction: column;
+    justify-content: space-between; pointer-events: none;
+  }}
+  .gbar-gridline {{ border-top: 1px solid var(--line); }}
+  .gbar-chart {{ display: flex; align-items: flex-end; gap: 1.25rem; height: 220px; position: relative; }}
+  .gbar-bars {{ display: flex; align-items: flex-end; gap: 2px; height: 220px; }}
+  .gbar {{ width: 14px; border-radius: 2px 2px 0 0; }}
+  .gbar-labels {{ display: flex; gap: 1.25rem; margin-top: 0.4rem; }}
+  .gbar-label {{
+    font-size: 0.7rem; color: var(--ink); writing-mode: vertical-rl; transform: rotate(180deg);
+    max-height: 130px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }}
   @media print {{
     :root, :root[data-theme="light"], :root[data-theme="dark"] {{
       --paper: #10160f; --ink: #ecf1ec; --muted: #9fb0a4; --line: #253229;
@@ -1149,6 +2033,58 @@ def generar_reporte_html(
     <h2>SKUs mas vendidos (top {top_n})</h2>
     <div class="table-wrap">{tabla_top_skus}</div>
   </section>
+
+  {f'''<section>
+    <h2>GMV, ticket por unidad, unidades y margen por categoria</h2>
+    {grid_categoria}
+  </section>''' if categoria_df is not None and len(categoria_df) else ''}
+
+  {f'''<section>
+    <h2>GMV, ticket por unidad, unidades y margen por departamento</h2>
+    {grid_departamento}
+  </section>''' if departamento_df is not None and len(departamento_df) else ''}
+
+  {f'''<section>
+    <h2>Performance por plataforma</h2>
+    <div class="table-wrap">{tabla_marketplace}</div>
+    <p class="nota">Plataforma = MARKETPLACE de MASTER_ORDERLINE (justo/express/uber/rappi/didi) - en cual canal vendio mas la campana. Pastel solo para GMV/Volumen (son "parte de un todo"); ticket por unidad y margen son tasas/promedios, se muestran como barras.</p>
+    <div class="chart-grid">
+      <div class="chart-block">{pastel_marketplace_gmv}</div>
+      <div class="chart-block">{pastel_marketplace_vol}</div>
+    </div>
+    {grid_marketplace}
+    <h3>Categoria x plataforma</h3>
+    {grid_categoria_plataforma}
+    <h3>Departamento x plataforma</h3>
+    {grid_departamento_plataforma}
+  </section>''' if tabla_marketplace else ''}
+
+  {f'''<section>
+    <h2>Performance por tipo de cliente</h2>
+    <div class="table-wrap">{tabla_segmento_usuario}</div>
+    <p class="nota">Tipo de cliente = clasificacion oficial de Justo (MASTER_ORDER.USER_STATUS_ORDER_DELIVERED): Nuevo/Recurrente/Reactivado. "Sin dato" es una orden sin esa clasificacion (no se descarta).</p>
+    <div class="chart-grid">
+      <div class="chart-block">{pastel_segmento_gmv}</div>
+      <div class="chart-block">{pastel_segmento_vol}</div>
+    </div>
+    {grid_segmento_usuario}
+    <h3>Categoria x tipo de cliente</h3>
+    {grid_categoria_segmento}
+    <h3>Departamento x tipo de cliente</h3>
+    {grid_departamento_segmento}
+    {f"""<h3>Usuarios distintos y ticket promedio por usuario</h3>
+    <div class="table-wrap">{tabla_usuarios_segmento}</div>
+    <p class="nota">Usuarios distintos (no solo GMV/unidades, que pueden estar concentrados en pocas personas) y ticket promedio POR USUARIO - compara segmentos sin el sesgo de tamano de grupo.</p>""" if tabla_usuarios_segmento else ""}
+    {f"""<h3>Cruce plataforma x tipo de cliente</h3>
+    <div class="table-wrap">{tabla_plataforma_segmento}</div>
+    <p class="nota">GMV por plataforma x tipo de cliente - si "Sin dato" se concentra en uber/rappi/didi (no en justo/express), confirma que es marketplace externo sin clasificar.</p>""" if tabla_plataforma_segmento else ""}
+  </section>''' if tabla_segmento_usuario else ''}
+
+  {f'''<section>
+    <h2>GMV, margen y volumen por mecanica x plataforma x tipo de cliente</h2>
+    <div class="table-wrap">{tabla_descuento_plataforma_segmento}</div>
+    <p class="nota">Tabla granular a proposito (no grafica) - para preguntas puntuales tipo "¿el 5x4 en Uber le fue mejor a Recurrentes o a Nuevos?".</p>
+  </section>''' if tabla_descuento_plataforma_segmento else ''}
 
   <!-- Validacion de redencion sacada a proposito (ver comentario arriba de
        html_doc) - no eliminada, el usuario aun no la entiende del todo pero

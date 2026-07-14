@@ -73,6 +73,42 @@ export default function FilterBar({ filters, value, onChange }: Props) {
           </option>
         ))}
       </select>
+
+      <select
+        value={value.marketplace ?? ''}
+        onChange={(e) => onChange({ ...value, marketplace: e.target.value || undefined })}
+      >
+        <option value="">Todas las plataformas</option>
+        {filters.marketplaces.map((m) => (
+          <option key={m} value={m}>
+            {m}
+          </option>
+        ))}
+      </select>
+
+      <select
+        value={value.segmento_usuario ?? ''}
+        onChange={(e) => onChange({ ...value, segmento_usuario: e.target.value || undefined })}
+      >
+        <option value="">Todos los tipos de cliente</option>
+        {filters.segmentos_usuario.map((s) => (
+          <option key={s} value={s}>
+            {s}
+          </option>
+        ))}
+      </select>
+
+      <select
+        value={value.mecanica ?? ''}
+        onChange={(e) => onChange({ ...value, mecanica: e.target.value || undefined })}
+      >
+        <option value="">Todas las mecanicas</option>
+        {filters.mecanicas.map((m) => (
+          <option key={m} value={m}>
+            {m}
+          </option>
+        ))}
+      </select>
     </div>
   )
 }

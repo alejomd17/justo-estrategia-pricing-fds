@@ -35,6 +35,108 @@ export interface MechanicRow {
   GANANCIA_POR_ESTRATEGIA: number | null
 }
 
+export interface MarketplaceRow {
+  MARKETPLACE: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+  TICKET_POR_UNIDAD: number | null
+}
+
+export interface SegmentoUsuarioRow {
+  SEGMENTO_USUARIO: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+  TICKET_POR_UNIDAD: number | null
+}
+
+export interface CategoriaPlataformaRow {
+  CATEGORIA: string | null
+  MARKETPLACE: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+  TICKET_POR_UNIDAD: number | null
+}
+
+export interface DepartamentoPlataformaRow {
+  DEPARTAMENTO: string | null
+  MARKETPLACE: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+  TICKET_POR_UNIDAD: number | null
+}
+
+export interface CategoriaSegmentoRow {
+  CATEGORIA: string | null
+  SEGMENTO_USUARIO: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+  TICKET_POR_UNIDAD: number | null
+}
+
+export interface DepartamentoSegmentoRow {
+  DEPARTAMENTO: string | null
+  SEGMENTO_USUARIO: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+  TICKET_POR_UNIDAD: number | null
+}
+
+export interface CategoriaRow {
+  CATEGORIA: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+  TICKET_POR_UNIDAD: number | null
+}
+
+export interface DepartamentoRow {
+  DEPARTAMENTO: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+  TICKET_POR_UNIDAD: number | null
+}
+
+export interface PlataformaSegmentoRow {
+  MARKETPLACE: string | null
+  SEGMENTO_USUARIO: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+}
+
+export interface UsuariosSegmentoRow {
+  SEGMENTO_USUARIO: string | null
+  USUARIOS_DISTINTOS: number
+  GMV_TOTAL: number | null
+  TICKET_PROMEDIO_USUARIO: number | null
+}
+
+export interface DescuentoPlataformaSegmentoRow {
+  MECANICA_EJECUTADA: string | null
+  MARKETPLACE: string | null
+  SEGMENTO_USUARIO: string | null
+  SKUS: number
+  UNIDADES_TOTALES: number | null
+  GMV_TOTAL: number | null
+  MARGEN_PROMEDIO: number | null
+}
+
 export interface TopSkuRow {
   SKU: number
   STORE_ID: number
@@ -57,6 +159,9 @@ export interface Filters {
   stores: StoreOption[]
   origenes: string[]
   adopciones: string[]
+  marketplaces: string[]
+  segmentos_usuario: string[]
+  mecanicas: string[]
 }
 
 export interface CampaignFilters {
@@ -65,4 +170,7 @@ export interface CampaignFilters {
   store_id?: number
   origen?: string
   adopcion?: string
+  marketplace?: string
+  segmento_usuario?: string
+  mecanica?: string
 }

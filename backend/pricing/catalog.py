@@ -1,6 +1,16 @@
 """Catalogo real de Snowflake: FULL_MASTER_CATALOG y VW_PRICING_DASHBOARD."""
 
+import time
+
 import pandas as pd
+
+# Cache en memoria para get_medida_variable: escanea TODO el historico de
+# FACT_FULFILLMENT_LINE y su resultado es un atributo fijo del producto (un
+# SKU de peso variable no deja de serlo entre dos clics de filtro del
+# dashboard). Sin esto, performance_por_mecanica re-corria el escaneo
+# completo en CADA request - la causa principal de la lentitud al filtrar.
+_MEDIDA_VARIABLE_CACHE = {"ts": 0.0, "df": None}
+_CACHE_TTL_SEGUNDOS = 900  # 15 min - suficiente para una sesion de exploracion
 
 
 def get_full_master_catalog(cur) -> pd.DataFrame:
@@ -58,7 +68,17 @@ def get_medida_variable(cur) -> pd.DataFrame:
     Si un SKU+tienda ALGUNA VEZ se vendio con QUANTITY_KG > 0, se vende por
     peso (para SKUs por pieza QUANTITY_KG viene en 0, confirmado en la fila
     de muestra revisada). No hace falta "la fila mas reciente" - es un
-    atributo fijo del producto, no cambia por orden."""
+    atributo fijo del producto, no cambia por orden.
+
+    Cacheado en memoria por _CACHE_TTL_SEGUNDOS (el resultado no depende de
+    ningun filtro y la query escanea todo el historico de la tabla)."""
+    ahora = time.monotonic()
+    if (
+        _MEDIDA_VARIABLE_CACHE["df"] is not None
+        and ahora - _MEDIDA_VARIABLE_CACHE["ts"] < _CACHE_TTL_SEGUNDOS
+    ):
+        return _MEDIDA_VARIABLE_CACHE["df"].copy()
+
     cur.execute("""
         SELECT
             PRODUCT_ID::VARCHAR AS SKU,
@@ -76,7 +96,10 @@ def get_medida_variable(cur) -> pd.DataFrame:
     df["SKU"] = df["SKU"].astype(int)
     df["STORE_ID"] = df["STORE_ID"].astype(int)
     df["ES_PESO_VARIABLE"] = df["MAX_QUANTITY_KG"] > 0
-    return df[["SKU", "STORE_ID", "ES_PESO_VARIABLE"]]
+    resultado = df[["SKU", "STORE_ID", "ES_PESO_VARIABLE"]]
+    _MEDIDA_VARIABLE_CACHE.update(ts=ahora, df=resultado)
+    # .copy() para que ningun caller mute el DataFrame cacheado
+    return resultado.copy()
 
 
 def get_pricing_dashboard(cur, skus=None) -> pd.DataFrame:

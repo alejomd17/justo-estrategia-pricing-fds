@@ -1,12 +1,37 @@
-import { useEffect, useState } from 'react'
-import { fetchCampaigns, fetchFilters, fetchMechanics, fetchSummary, fetchTopSkus } from './api'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  fetchCampaigns,
+  fetchCategoriaPlataforma,
+  fetchCategoriaSegmento,
+  fetchDepartamentoPlataforma,
+  fetchDepartamentoSegmento,
+  fetchDescuentoPlataformaSegmento,
+  fetchFilters,
+  fetchMarketplace,
+  fetchMechanics,
+  fetchPlataformaSegmento,
+  fetchSegmentoUsuario,
+  fetchSummary,
+  fetchTopSkus,
+  fetchUsuariosSegmento,
+} from './api'
+import { rollupPorCategoria, rollupPorDepartamento } from './rollups'
 import type {
   AdoptionSummary,
   Campaign,
   CampaignFilters,
+  CategoriaPlataformaRow,
+  CategoriaSegmentoRow,
+  DepartamentoPlataformaRow,
+  DepartamentoSegmentoRow,
+  DescuentoPlataformaSegmentoRow,
   Filters,
+  MarketplaceRow,
   MechanicRow,
+  PlataformaSegmentoRow,
+  SegmentoUsuarioRow,
   TopSkuRow,
+  UsuariosSegmentoRow,
 } from './types'
 import CampaignSelector from './components/CampaignSelector'
 import FilterBar from './components/FilterBar'
@@ -14,6 +39,10 @@ import KpiCards from './components/KpiCards'
 import MechanicsTable from './components/MechanicsTable'
 import TopSkusTable from './components/TopSkusTable'
 import TopChartsSection from './components/TopChartsSection'
+import PlatformSection from './components/PlatformSection'
+import SegmentSection from './components/SegmentSection'
+import DimensionMetricsSection from './components/DimensionMetricsSection'
+import DescuentoPlataformaSegmentoTable from './components/DescuentoPlataformaSegmentoTable'
 import './App.css'
 
 function App() {
@@ -29,6 +58,15 @@ function App() {
   const [summary, setSummary] = useState<AdoptionSummary | null>(null)
   const [mechanics, setMechanics] = useState<MechanicRow[]>([])
   const [topSkus, setTopSkus] = useState<TopSkuRow[]>([])
+  const [marketplace, setMarketplace] = useState<MarketplaceRow[]>([])
+  const [segmentoUsuario, setSegmentoUsuario] = useState<SegmentoUsuarioRow[]>([])
+  const [categoriaPlataforma, setCategoriaPlataforma] = useState<CategoriaPlataformaRow[]>([])
+  const [departamentoPlataforma, setDepartamentoPlataforma] = useState<DepartamentoPlataformaRow[]>([])
+  const [categoriaSegmento, setCategoriaSegmento] = useState<CategoriaSegmentoRow[]>([])
+  const [departamentoSegmento, setDepartamentoSegmento] = useState<DepartamentoSegmentoRow[]>([])
+  const [plataformaSegmento, setPlataformaSegmento] = useState<PlataformaSegmentoRow[]>([])
+  const [usuariosSegmento, setUsuariosSegmento] = useState<UsuariosSegmentoRow[]>([])
+  const [descuentoPlataformaSegmento, setDescuentoPlataformaSegmento] = useState<DescuentoPlataformaSegmentoRow[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // Fila de "Performance FDS" seleccionada por click, para filtrar la tabla
@@ -70,12 +108,30 @@ function App() {
       fetchSummary(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
       fetchMechanics(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
       fetchTopSkus(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchMarketplace(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchSegmentoUsuario(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchCategoriaPlataforma(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchDepartamentoPlataforma(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchCategoriaSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchDepartamentoSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchPlataformaSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchUsuariosSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchDescuentoPlataformaSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
     ])
-      .then(([s, m, t]) => {
+      .then(([s, m, t, mp, su, catPlat, depPlat, catSeg, depSeg, ps, us, dps]) => {
         if (ignore) return
         setSummary(s)
         setMechanics(m)
         setTopSkus(t)
+        setMarketplace(mp)
+        setSegmentoUsuario(su)
+        setCategoriaPlataforma(catPlat)
+        setDepartamentoPlataforma(depPlat)
+        setCategoriaSegmento(catSeg)
+        setDepartamentoSegmento(depSeg)
+        setPlataformaSegmento(ps)
+        setUsuariosSegmento(us)
+        setDescuentoPlataformaSegmento(dps)
       })
       .catch((e) => !ignore && setError(String(e)))
       .finally(() => !ignore && setLoading(false))
@@ -98,6 +154,12 @@ function App() {
   }
 
   const topSkusFiltrados = selectedGroup ? topSkus.filter((s) => coincideConGrupo(s, selectedGroup)) : topSkus
+
+  // Re-agregacion local de /mechanics (ver rollups.ts) - antes eran 2
+  // llamadas mas a la API que re-ejecutaban performance_por_mecanica
+  // completo en el backend por cada cambio de filtro.
+  const categoria = useMemo(() => rollupPorCategoria(mechanics), [mechanics])
+  const departamento = useMemo(() => rollupPorDepartamento(mechanics), [mechanics])
 
   return (
     <div style={{ padding: '2rem', maxWidth: '1800px', margin: '0 auto' }}>
@@ -156,6 +218,55 @@ function App() {
               )}
             </div>
             <TopSkusTable rows={topSkusFiltrados} />
+          </section>
+        )}
+
+        {categoria.length > 0 && (
+          <section style={{ marginTop: '1.5rem' }}>
+            <h2>GMV, ticket por unidad, unidades y margen por categoría</h2>
+            <DimensionMetricsSection rows={categoria} labelKey="CATEGORIA" />
+          </section>
+        )}
+
+        {departamento.length > 0 && (
+          <section style={{ marginTop: '1.5rem' }}>
+            <h2>GMV, ticket por unidad, unidades y margen por departamento</h2>
+            <DimensionMetricsSection rows={departamento} labelKey="DEPARTAMENTO" />
+          </section>
+        )}
+
+        {/* Todo lo de plataforma junto (tabla, pasteles, grid, cruces con
+            categoria/departamento) - no interfolado con la seccion de cliente. */}
+        {marketplace.length > 0 && (
+          <section style={{ marginTop: '1.5rem' }}>
+            <h2>Performance por plataforma</h2>
+            <PlatformSection
+              rows={marketplace}
+              categoriaPlataforma={categoriaPlataforma}
+              departamentoPlataforma={departamentoPlataforma}
+            />
+          </section>
+        )}
+
+        {/* Todo lo de tipo de cliente junto (tabla, pasteles, grid, cruces
+            con categoria/departamento, usuarios distintos, cruce con plataforma). */}
+        {segmentoUsuario.length > 0 && (
+          <section style={{ marginTop: '1.5rem' }}>
+            <h2>Performance por tipo de cliente</h2>
+            <SegmentSection
+              rows={segmentoUsuario}
+              categoriaSegmento={categoriaSegmento}
+              departamentoSegmento={departamentoSegmento}
+              usuariosSegmento={usuariosSegmento}
+              plataformaSegmento={plataformaSegmento}
+            />
+          </section>
+        )}
+
+        {descuentoPlataformaSegmento.length > 0 && (
+          <section style={{ marginTop: '1.5rem' }}>
+            <h2>GMV, margen y volumen por mecánica x plataforma x tipo de cliente</h2>
+            <DescuentoPlataformaSegmentoTable rows={descuentoPlataformaSegmento} />
           </section>
         )}
       </div>
