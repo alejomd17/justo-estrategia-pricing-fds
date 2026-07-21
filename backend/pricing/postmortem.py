@@ -960,6 +960,256 @@ def resumen_usuarios_por_segmento(
     return df
 
 
+def resumen_enganche_ticket(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    store_id=None,
+    marketplace=None,
+) -> pd.DataFrame:
+    """Enganche en el ticket COMPLETO: el ticket promedio por cliente de la
+    campana (~$86 en 11-13 jul) solo cuenta lo gastado en PRODUCTOS DE LA
+    CAMPANA - esta funcion responde la pregunta que sigue: ¿cuanto gasto
+    ese cliente en TODO su carrito de la ventana (incluyendo lo que no
+    estaba en promocion), y cuanto gasto el cliente que NO compro nada de
+    la campana?
+
+    Devuelve 2 filas (compraron campana / no compraron campana) con:
+    - USUARIOS: clientes distintos del grupo.
+    - TICKET_TOTAL_PROMEDIO: gasto TOTAL por cliente en la ventana (todo el
+      carrito, cualquier origen - promovido o no).
+    - GASTO_CAMPANA_PROMEDIO: de ese total, cuanto fue en productos de la
+      campana (WKND con mecanica real).
+    - GASTO_RESTO_PROMEDIO: el "arrastre" - lo demas que echaron al carrito.
+    - PCT_CAMPANA_EN_TICKET: % del ticket que fue campana (a nivel grupo).
+
+    Lectura: si el que compro campana tiene un ticket total mucho mayor que
+    su gasto en campana, la promo arrastro carrito completo; compararlo
+    contra el grupo que no compro campana da la referencia de si ese
+    cliente ya era de ticket alto o el enganche es real. CAVEAT: es una
+    comparacion descriptiva, no causal (el que busca la promo puede ser de
+    por si un cliente de canasta grande).
+
+    Solo acepta filtros de tienda/plataforma: filtrar por categoria o
+    mecanica romperia la definicion de "ticket completo". Pedidos sin
+    USER_ID identificable quedan fuera (no se puede seguir su carrito)."""
+    condiciones = []
+    params = []
+    if store_id:
+        condiciones.append("STORE_ID = %s")
+        params.append(int(store_id))
+    if marketplace:
+        condiciones.append("MARKETPLACE = %s")
+        params.append(marketplace)
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s", "USER_ID IS NOT NULL"] + condiciones)
+    cur.execute(
+        f"""
+        WITH gasto_por_usuario AS (
+            SELECT
+                USER_ID,
+                SUM(GMV) AS GMV_TOTAL,
+                SUM(CASE WHEN ORIGEN_CAMPANA = 'WKND' AND MECANICA_EJECUTADA IS NOT NULL
+                         THEN GMV ELSE 0 END) AS GMV_CAMPANA
+            FROM {TABLA_POSTMORTEM}
+            WHERE {where_clause}
+            GROUP BY USER_ID
+        )
+        SELECT
+            CASE WHEN GMV_CAMPANA > 0 THEN 'Compraron campaña' ELSE 'No compraron campaña' END AS GRUPO,
+            COUNT(*) AS USUARIOS,
+            SUM(GMV_TOTAL) AS GMV_TOTAL,
+            SUM(GMV_CAMPANA) AS GMV_CAMPANA
+        FROM gasto_por_usuario
+        GROUP BY 1
+        ORDER BY GRUPO
+        """,
+        [campaign_start.date(), campaign_end.date()] + params,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["GMV_CAMPANA"] = df["GMV_CAMPANA"].astype(float)
+    df["TICKET_TOTAL_PROMEDIO"] = df["GMV_TOTAL"] / df["USUARIOS"]
+    df["GASTO_CAMPANA_PROMEDIO"] = df["GMV_CAMPANA"] / df["USUARIOS"]
+    df["GASTO_RESTO_PROMEDIO"] = df["TICKET_TOTAL_PROMEDIO"] - df["GASTO_CAMPANA_PROMEDIO"]
+    df["PCT_CAMPANA_EN_TICKET"] = df["GMV_CAMPANA"] / df["GMV_TOTAL"] * 100
+    return df
+
+
+def resumen_enganche_por_segmento(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    store_id=None,
+    marketplace=None,
+) -> pd.DataFrame:
+    """Enganche cruzado con tipo de cliente - responde '¿el REACTIVADO que
+    compro campana termino comprando mas cosas, o no?': para cada
+    SEGMENTO_USUARIO compara el gasto TOTAL en la ventana (todo el carrito)
+    de quien compro algo de la campana vs. quien no compro nada, dentro del
+    mismo segmento. Comparar dentro del segmento quita parte del sesgo de
+    la comparacion global (un reactivado se compara contra otros
+    reactivados, no contra recurrentes de canasta grande).
+
+    Un cliente puede aparecer con 2 clasificaciones en la misma ventana
+    (ej. su primera orden fue 'Reactivado' y la segunda ya 'Recurrente') -
+    aqui se le asigna UN solo segmento, el de mayor gasto (dominante), para
+    no contarlo doble. Por eso los conteos pueden diferir en +-1 de la
+    tabla de usuarios por segmento (que cuenta al cliente en cada segmento
+    donde aparecio).
+
+    Mismos filtros/caveats que resumen_enganche_ticket: solo tienda/
+    plataforma, requiere USER_ID (marketplaces externos quedan fuera),
+    descriptivo no causal."""
+    condiciones = []
+    params = []
+    if store_id:
+        condiciones.append("STORE_ID = %s")
+        params.append(int(store_id))
+    if marketplace:
+        condiciones.append("MARKETPLACE = %s")
+        params.append(marketplace)
+    where_clause = " AND ".join(["FECHA BETWEEN %s AND %s", "USER_ID IS NOT NULL"] + condiciones)
+    cur.execute(
+        f"""
+        WITH gasto AS (
+            SELECT
+                USER_ID,
+                SEGMENTO_USUARIO,
+                SUM(GMV) AS GMV_SEG,
+                SUM(CASE WHEN ORIGEN_CAMPANA = 'WKND' AND MECANICA_EJECUTADA IS NOT NULL
+                         THEN GMV ELSE 0 END) AS GMV_CAMPANA_SEG
+            FROM {TABLA_POSTMORTEM}
+            WHERE {where_clause}
+            GROUP BY USER_ID, SEGMENTO_USUARIO
+        ),
+        dominante AS (
+            SELECT USER_ID, SEGMENTO_USUARIO,
+                   ROW_NUMBER() OVER (PARTITION BY USER_ID ORDER BY GMV_SEG DESC) AS rn
+            FROM gasto
+        ),
+        usuario AS (
+            SELECT
+                g.USER_ID,
+                d.SEGMENTO_USUARIO,
+                SUM(g.GMV_SEG) AS GMV_TOTAL,
+                SUM(g.GMV_CAMPANA_SEG) AS GMV_CAMPANA
+            FROM gasto g
+            JOIN dominante d ON g.USER_ID = d.USER_ID AND d.rn = 1
+            GROUP BY g.USER_ID, d.SEGMENTO_USUARIO
+        )
+        SELECT
+            SEGMENTO_USUARIO,
+            CASE WHEN GMV_CAMPANA > 0 THEN 'Compraron campaña' ELSE 'No compraron campaña' END AS GRUPO,
+            COUNT(*) AS USUARIOS,
+            SUM(GMV_TOTAL) AS GMV_TOTAL,
+            SUM(GMV_CAMPANA) AS GMV_CAMPANA
+        FROM usuario
+        GROUP BY 1, 2
+        ORDER BY SUM(GMV_TOTAL) DESC
+        """,
+        [campaign_start.date(), campaign_end.date()] + params,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["GMV_CAMPANA"] = df["GMV_CAMPANA"].astype(float)
+    df["TICKET_TOTAL_PROMEDIO"] = df["GMV_TOTAL"] / df["USUARIOS"]
+    df["GASTO_CAMPANA_PROMEDIO"] = df["GMV_CAMPANA"] / df["USUARIOS"]
+    df["GASTO_RESTO_PROMEDIO"] = df["TICKET_TOTAL_PROMEDIO"] - df["GASTO_CAMPANA_PROMEDIO"]
+    df["PCT_CAMPANA_EN_TICKET"] = df["GMV_CAMPANA"] / df["GMV_TOTAL"] * 100
+    return df
+
+
+def resumen_enganche_por_orden(
+    cur,
+    campaign_start: pd.Timestamp,
+    campaign_end: pd.Timestamp,
+    store_id=None,
+    marketplace=None,
+) -> pd.DataFrame:
+    """Enganche a nivel de ORDEN (la unidad correcta para 'gancho'): ¿el
+    carrito donde venia un producto de la campana fue mas grande que un
+    carrito normal? A diferencia de resumen_enganche_ticket (por CLIENTE,
+    que mezcla tamano de carrito con frecuencia de compra en la ventana),
+    aqui cada orden cuenta una vez.
+
+    Devuelve 2 filas (ordenes con producto de campana / sin) con:
+    - ORDENES: cuantas ordenes hay en el grupo.
+    - TICKET_PROMEDIO_ORDEN: total del carrito promedio (todo el pedido,
+      promovido o no).
+    - GASTO_CAMPANA_PROMEDIO / GASTO_RESTO_PROMEDIO: dentro de las ordenes
+      con campana, cuanto fue producto promovido y cuanto arrastre.
+    - PCT_CAMPANA_EN_TICKET: % del carrito que fue campana (a nivel grupo).
+
+    Consulta MASTER_ORDERLINE directo (la ventana son ~3 dias, query
+    chica) porque la tabla materializada no guarda ORDER_ID; los SKUs "de
+    campana" salen de la tabla materializada (WKND con mecanica real en la
+    ventana). Bonus sobre la version por cliente: no necesita USER_ID, asi
+    que las ordenes de marketplaces externos (uber/rappi/didi) SI entran.
+    Misma advertencia: comparacion descriptiva, no causal."""
+    condiciones = []
+    params = []
+    if store_id:
+        condiciones.append("ml.STORE_ID = %s")
+        params.append(int(store_id))
+    if marketplace:
+        condiciones.append("ml.MARKETPLACE = %s")
+        params.append(marketplace)
+    where_extra = (" AND " + " AND ".join(condiciones)) if condiciones else ""
+    cur.execute(
+        f"""
+        WITH skus_campana AS (
+            SELECT DISTINCT TRY_TO_NUMBER(SKU::VARCHAR) AS SKU, STORE_ID
+            FROM {TABLA_POSTMORTEM}
+            WHERE FECHA BETWEEN %s AND %s
+              AND ORIGEN_CAMPANA = 'WKND'
+              AND MECANICA_EJECUTADA IS NOT NULL
+        ),
+        ordenes AS (
+            SELECT
+                ml.ORDER_ID,
+                SUM(ml.AMOUNT_GROSS_DELIVERED) AS TICKET_ORDEN,
+                SUM(CASE WHEN sc.SKU IS NOT NULL THEN ml.AMOUNT_GROSS_DELIVERED ELSE 0 END) AS GMV_CAMPANA
+            FROM MX_JUSTO_PROD.DR_MASTER_TABLES.MASTER_ORDERLINE ml
+            LEFT JOIN skus_campana sc
+                ON TRY_TO_NUMBER(ml.PRODUCT_ID::VARCHAR) = sc.SKU
+               AND ml.STORE_ID = sc.STORE_ID
+            WHERE ml.STATUS_ORDER = 'delivered'
+              AND ml.STORE_ID IN (9, 14)
+              AND ml.QUANTITY_FULFILLED_PZ > 0
+              AND TO_DATE(ml.DATETIME_DELIVERY) BETWEEN %s AND %s{where_extra}
+            GROUP BY ml.ORDER_ID
+        )
+        SELECT
+            CASE WHEN GMV_CAMPANA > 0 THEN 'Ordenes con producto de campaña'
+                 ELSE 'Ordenes sin producto de campaña' END AS GRUPO,
+            COUNT(*) AS ORDENES,
+            SUM(TICKET_ORDEN) AS GMV_TOTAL,
+            SUM(GMV_CAMPANA) AS GMV_CAMPANA
+        FROM ordenes
+        GROUP BY 1
+        ORDER BY GRUPO
+        """,
+        [campaign_start.date(), campaign_end.date(), campaign_start.date(), campaign_end.date()] + params,
+    )
+    columnas = [c[0] for c in cur.description]
+    df = pd.DataFrame(cur.fetchall(), columns=columnas)
+    if df.empty:
+        return df
+    df["GMV_TOTAL"] = df["GMV_TOTAL"].astype(float)
+    df["GMV_CAMPANA"] = df["GMV_CAMPANA"].astype(float)
+    df["TICKET_PROMEDIO_ORDEN"] = df["GMV_TOTAL"] / df["ORDENES"]
+    df["GASTO_CAMPANA_PROMEDIO"] = df["GMV_CAMPANA"] / df["ORDENES"]
+    df["GASTO_RESTO_PROMEDIO"] = df["TICKET_PROMEDIO_ORDEN"] - df["GASTO_CAMPANA_PROMEDIO"]
+    df["PCT_CAMPANA_EN_TICKET"] = df["GMV_CAMPANA"] / df["GMV_TOTAL"] * 100
+    return df
+
+
 def resumen_descuento_plataforma_segmento(
     cur,
     campaign_start: pd.Timestamp,
@@ -1610,6 +1860,9 @@ def generar_reporte_html(
     departamento_plataforma_df: pd.DataFrame = None,
     categoria_segmento_df: pd.DataFrame = None,
     departamento_segmento_df: pd.DataFrame = None,
+    enganche_df: pd.DataFrame = None,
+    enganche_orden_df: pd.DataFrame = None,
+    enganche_segmento_df: pd.DataFrame = None,
 ) -> str:
     """Reporte HTML autonomo (mismo sistema de tokens/paleta que las fichas
     tecnicas hechas a mano durante el proyecto) a partir de los resultados
@@ -1684,13 +1937,53 @@ def generar_reporte_html(
         if len(wknd):
             adopcion_pct = round(wknd["SKU_TIENDAS_CON_PROMO_REAL"].iloc[0] / total_planeado * 100, 1)
 
+    # Solo WKND - "Otra fuente" sacada del visual a proposito (pedido del
+    # usuario 2026-07-14, mismo criterio que KpiCards.tsx): no responde a
+    # los filtros y con WKND fijo solo confundia.
     origen_cards = ""
     if resumen_df is not None and len(resumen_df):
-        for _, row in resumen_df[resumen_df["ORIGEN_CAMPANA"] != "Sin promo"].iterrows():
+        for _, row in resumen_df[resumen_df["ORIGEN_CAMPANA"] == "WKND"].iterrows():
             origen_cards += (
                 f'<div class="kpi"><div class="label">{html.escape(str(row["ORIGEN_CAMPANA"]))}</div>'
                 f'<div class="value">{_fmt_num(row["SKU_TIENDAS_CON_PROMO_REAL"])} / {_fmt_num(row["SKU_TIENDAS"])}</div></div>'
             )
+
+    # Resumen ejecutivo (mismos 5 KPIs y subtitulo que KpiCards.tsx del
+    # dashboard) - "el resultado de la campana como tal, ya no granulado".
+    pct_incremental = (
+        ganancia_total / gmv_total * 100 if pd.notna(gmv_total) and gmv_total > 0 and pd.notna(ganancia_total) else None
+    )
+    clientes_reactivados = None
+    if usuarios_segmento_df is not None and len(usuarios_segmento_df):
+        fila = usuarios_segmento_df[usuarios_segmento_df["SEGMENTO_USUARIO"] == "Reactivado"]
+        if len(fila):
+            clientes_reactivados = int(fila["USUARIOS_DISTINTOS"].iloc[0])
+    margen_reactivados = None
+    if segmento_usuario_df is not None and len(segmento_usuario_df):
+        fila = segmento_usuario_df[segmento_usuario_df["SEGMENTO_USUARIO"] == "Reactivado"]
+        if len(fila) and pd.notna(fila["MARGEN_PROMEDIO"].iloc[0]):
+            margen_reactivados = float(fila["MARGEN_PROMEDIO"].iloc[0])
+
+    partes_subtitulo = []
+    if pd.notna(traccion_promedio):
+        partes_subtitulo.append(f"Lift {traccion_promedio:.2f}x vs ritmo historico")
+    if resumen_df is not None and len(resumen_df):
+        wknd_fila = resumen_df[resumen_df["ORIGEN_CAMPANA"] == "WKND"]
+        if len(wknd_fila):
+            partes_subtitulo.append(
+                f"{_fmt_num(wknd_fila['SKU_TIENDAS_CON_PROMO_REAL'].iloc[0])} de "
+                f"{_fmt_num(wknd_fila['SKU_TIENDAS'].iloc[0])} grupos ejecutados del plan WKND"
+            )
+    if len(performance_df) and pd.notna(gmv_total) and gmv_total > 0:
+        por_tienda = performance_df.groupby("STORE_ID")["GMV_TOTAL"].sum().sort_values(ascending=False)
+        tienda_top = por_tienda.index[0]
+        partes_subtitulo.append(
+            f"{_STORE_NAMES_REPORTE.get(int(tienda_top), tienda_top)} concentro "
+            f"{por_tienda.iloc[0] / gmv_total * 100:.0f}% del GMV"
+        )
+    subtitulo_html = (
+        f'<p class="meta">{html.escape(" · ".join(partes_subtitulo))}</p>' if partes_subtitulo else ""
+    )
 
     tabla_performance = _tabla_html(
         performance_df.head(top_n),
@@ -1816,6 +2109,59 @@ def generar_reporte_html(
     grid_categoria_segmento = _grid_cruzado_html(categoria_segmento_df, "CATEGORIA", "SEGMENTO_USUARIO", _COLORES_SEGMENTO_REPORTE)
     grid_departamento_segmento = _grid_cruzado_html(departamento_segmento_df, "DEPARTAMENTO", "SEGMENTO_USUARIO", _COLORES_SEGMENTO_REPORTE)
 
+    tabla_enganche = None
+    if enganche_df is not None and len(enganche_df):
+        tabla_enganche = _tabla_html(
+            enganche_df,
+            [
+                ("GRUPO", "Grupo", None),
+                ("USUARIOS", "Clientes", _fmt_num),
+                ("TICKET_TOTAL_PROMEDIO", "Gasto TOTAL por cliente (ventana)", _fmt_moneda),
+                ("GASTO_CAMPANA_PROMEDIO", "Gasto en campaña", _fmt_moneda),
+                ("GASTO_RESTO_PROMEDIO", "Resto del carrito", _fmt_moneda),
+                ("PCT_CAMPANA_EN_TICKET", "% campaña en el ticket", _fmt_pct),
+            ],
+        )
+
+    tabla_enganche_segmento = grafica_enganche_segmento = None
+    if enganche_segmento_df is not None and len(enganche_segmento_df):
+        tabla_enganche_segmento = _tabla_html(
+            enganche_segmento_df,
+            [
+                ("SEGMENTO_USUARIO", "Tipo de cliente", None),
+                ("GRUPO", "Grupo", None),
+                ("USUARIOS", "Clientes", _fmt_num),
+                ("TICKET_TOTAL_PROMEDIO", "Gasto TOTAL por cliente (ventana)", _fmt_moneda),
+                ("GASTO_CAMPANA_PROMEDIO", "Gasto en campaña", _fmt_moneda),
+                ("GASTO_RESTO_PROMEDIO", "Resto del carrito", _fmt_moneda),
+                ("PCT_CAMPANA_EN_TICKET", "% campaña en el ticket", _fmt_pct),
+            ],
+        )
+        # Barras comparativas (verde=compro campaña, gris=no) por segmento -
+        # mismo visual que EngancheTable.tsx del dashboard.
+        colores_enganche = {"Compraron campaña": _GOOD_REPORTE, "No compraron campaña": "#888888"}
+        seg_tmp = enganche_segmento_df.dropna(subset=["TICKET_TOTAL_PROMEDIO"]).copy()
+        seg_tmp["_SEG"] = seg_tmp["SEGMENTO_USUARIO"].fillna("Sin dato")
+        grupos_enganche = [
+            (seg, list(zip(g.sort_values("GRUPO")["GRUPO"], g.sort_values("GRUPO")["TICKET_TOTAL_PROMEDIO"])))
+            for seg, g in seg_tmp.groupby("_SEG", sort=False)
+        ]
+        grafica_enganche_segmento = _grouped_bar_html(grupos_enganche, colores_enganche, _fmt_moneda)
+
+    tabla_enganche_orden = None
+    if enganche_orden_df is not None and len(enganche_orden_df):
+        tabla_enganche_orden = _tabla_html(
+            enganche_orden_df,
+            [
+                ("GRUPO", "Grupo", None),
+                ("ORDENES", "Ordenes", _fmt_num),
+                ("TICKET_PROMEDIO_ORDEN", "Ticket promedio por orden", _fmt_moneda),
+                ("GASTO_CAMPANA_PROMEDIO", "Gasto en campaña", _fmt_moneda),
+                ("GASTO_RESTO_PROMEDIO", "Resto del carrito", _fmt_moneda),
+                ("PCT_CAMPANA_EN_TICKET", "% campaña en el ticket", _fmt_pct),
+            ],
+        )
+
     tabla_plataforma_segmento = None
     if plataforma_segmento_df is not None and len(plataforma_segmento_df):
         tabla_plataforma_segmento = _pivot_html(
@@ -1928,6 +2274,7 @@ def generar_reporte_html(
   }}
   .kpi .label {{ font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }}
   .kpi .value {{ font-size: 1.3rem; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 0.3rem; }}
+  .kpi .sub {{ font-size: 0.75rem; color: var(--muted); margin-top: 0.15rem; }}
   .table-wrap {{ overflow-x: auto; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
   th, td {{ text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; white-space: nowrap; }}
@@ -1995,17 +2342,20 @@ def generar_reporte_html(
 <body>
 <div class="sheet">
   <div class="masthead">
-    <p class="eyebrow">Post-mortem de campana</p>
+    <p class="eyebrow">Resultados de campaña</p>
     <h1>{campaign_start.date()} a {campaign_end.date()}</h1>
     <p class="meta">Generado {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')} · Tiendas 9 (Atizapan) y 14 (Coyoacan)</p>
+    {subtitulo_html}
   </div>
 
   <div class="kpis">
+    <div class="kpi"><div class="label">GMV de campaña</div><div class="value">{_fmt_moneda(gmv_total)}</div></div>
+    <div class="kpi"><div class="label">Venta incremental</div><div class="value">{_fmt_moneda(ganancia_total)}</div>{f'<div class="sub">{pct_incremental:.0f}% del GMV · vs ritmo historico</div>' if pct_incremental is not None else ''}</div>
+    <div class="kpi"><div class="label">Lift vs historico</div><div class="value">{_fmt_ratio(traccion_promedio)}</div></div>
+    <div class="kpi"><div class="label">Clientes reactivados</div><div class="value">{clientes_reactivados if clientes_reactivados is not None else "N/D"}</div></div>
+    <div class="kpi"><div class="label">Margen en reactivados</div><div class="value">{_fmt_pct(margen_reactivados) if margen_reactivados is not None else "N/D"}</div></div>
     <div class="kpi"><div class="label">Planeado</div><div class="value">{_fmt_num(total_planeado) if total_planeado is not None else "N/D"}</div></div>
     <div class="kpi"><div class="label">Adopcion</div><div class="value">{f"{adopcion_pct}%" if adopcion_pct is not None else "N/D"}</div></div>
-    <div class="kpi"><div class="label">GMV total (con campana)</div><div class="value">{_fmt_moneda(gmv_total)}</div></div>
-    <div class="kpi"><div class="label">Ganancia por estrategia</div><div class="value">{_fmt_moneda(ganancia_total)}</div></div>
-    <div class="kpi"><div class="label">Traccion promedio</div><div class="value">{_fmt_ratio(traccion_promedio)}</div></div>
     <div class="kpi"><div class="label">Grupos mecanica x categoria</div><div class="value">{n_grupos}</div></div>
     <!-- Grupos de peso variable sacado del KPI grid a proposito (pedido del
          usuario) - se mantiene la variable n_peso_variable porque la nota de
@@ -2014,9 +2364,22 @@ def generar_reporte_html(
     -->
     {origen_cards}
   </div>
+  <p class="nota">Venta incremental = GMV real menos lo que estos SKUs hubieran facturado a su ritmo historico (la "Ganancia por estrategia" de la tabla de abajo).</p>
+
+  {f'''<section>
+    <h2>Enganche: ticket completo</h2>
+    {f"""<h3>Por orden (¿el carrito con promo fue mas grande?)</h3>
+    <div class="table-wrap">{tabla_enganche_orden}</div>""" if tabla_enganche_orden else ""}
+    {f"""<h3>Por cliente (gasto total en la ventana)</h3>
+    <div class="table-wrap">{tabla_enganche}</div>""" if tabla_enganche else ""}
+    {f"""<h3>Por tipo de cliente (¿el reactivado que compro campaña, compro mas?)</h3>
+    {grafica_enganche_segmento}
+    <div class="table-wrap">{tabla_enganche_segmento}</div>""" if tabla_enganche_segmento else ""}
+    <p class="nota">"Resto del carrito" = lo que se llevo ademas de los productos de campaña. La vista por orden incluye marketplaces externos; las vistas por cliente/segmento no (requieren usuario identificable). Comparacion descriptiva, no causal: quien busca promos puede ser de por si un cliente de canasta grande.</p>
+  </section>''' if tabla_enganche or tabla_enganche_orden or tabla_enganche_segmento else ''}
   <!-- Nota de "Sin promo"/peso variable sacada del visual a proposito (pedido
        del usuario, mismo criterio que el KPI de peso variable de arriba).
-  <p class="nota">"Sin promo" (sin oferta propuesta ni ejecutada) se excluye siempre de este reporte - no es relevante para un post-mortem de campana. {n_peso_variable} grupo(s) de peso variable tienen Ganancia por estrategia en N/D (precio en $/kg no comparable contra unidades en piezas).</p>
+  <p class="nota">"Sin promo" (sin oferta propuesta ni ejecutada) se excluye siempre de este reporte - no es relevante para un post-mortem de campaña. {n_peso_variable} grupo(s) de peso variable tienen Ganancia por estrategia en N/D (precio en $/kg no comparable contra unidades en piezas).</p>
   -->
 
   <section>
@@ -2025,7 +2388,7 @@ def generar_reporte_html(
   </section>
 
   <section>
-    <h2>Tops de la campana</h2>
+    <h2>Tops de la campaña</h2>
     {tops_campana_html}
   </section>
 
@@ -2047,7 +2410,7 @@ def generar_reporte_html(
   {f'''<section>
     <h2>Performance por plataforma</h2>
     <div class="table-wrap">{tabla_marketplace}</div>
-    <p class="nota">Plataforma = MARKETPLACE de MASTER_ORDERLINE (justo/express/uber/rappi/didi) - en cual canal vendio mas la campana. Pastel solo para GMV/Volumen (son "parte de un todo"); ticket por unidad y margen son tasas/promedios, se muestran como barras.</p>
+    <p class="nota">Plataforma = MARKETPLACE de MASTER_ORDERLINE (justo/express/uber/rappi/didi) - en cual canal vendio mas la campaña. Pastel solo para GMV/Volumen (son "parte de un todo"); ticket por unidad y margen son tasas/promedios, se muestran como barras.</p>
     <div class="chart-grid">
       <div class="chart-block">{pastel_marketplace_gmv}</div>
       <div class="chart-block">{pastel_marketplace_vol}</div>

@@ -55,7 +55,7 @@ export default function PlatformSection({ rows, categoriaPlataforma, departament
       <DataTable columns={columns} rows={rows} pageSize={10} />
       <p style={{ fontSize: '0.85rem', opacity: 0.7, margin: '0.5rem 0 1.5rem' }}>
         Plataforma = MARKETPLACE de MASTER_ORDERLINE (justo/express/uber/rappi/didi) - responde en cual
-        canal vendio mas la campana. Pastel solo para GMV/Volumen (son "parte de un todo" - suman
+        canal vendio mas la campaña. Pastel solo para GMV/Volumen (son "parte de un todo" - suman
         100%); ticket por unidad y margen son tasas/promedios, no tienen lectura de pastel, se
         muestran como barras abajo.
       </p>

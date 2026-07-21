@@ -6,6 +6,9 @@ import {
   fetchDepartamentoPlataforma,
   fetchDepartamentoSegmento,
   fetchDescuentoPlataformaSegmento,
+  fetchEnganche,
+  fetchEngancheOrden,
+  fetchEngancheSegmento,
   fetchFilters,
   fetchMarketplace,
   fetchMechanics,
@@ -25,6 +28,9 @@ import type {
   DepartamentoPlataformaRow,
   DepartamentoSegmentoRow,
   DescuentoPlataformaSegmentoRow,
+  EngancheOrdenRow,
+  EngancheRow,
+  EngancheSegmentoRow,
   Filters,
   MarketplaceRow,
   MechanicRow,
@@ -39,6 +45,7 @@ import KpiCards from './components/KpiCards'
 import MechanicsTable from './components/MechanicsTable'
 import TopSkusTable from './components/TopSkusTable'
 import TopChartsSection from './components/TopChartsSection'
+import EngancheTable from './components/EngancheTable'
 import PlatformSection from './components/PlatformSection'
 import SegmentSection from './components/SegmentSection'
 import DimensionMetricsSection from './components/DimensionMetricsSection'
@@ -49,8 +56,9 @@ function App() {
   const [campaigns, setCampaigns] = useState<Campaign[]>([])
   const [selected, setSelected] = useState<Campaign | null>(null)
   const [filters, setFilters] = useState<Filters | null>(null)
-  // Por defecto solo lo nuestro (WKND) y lo que si se ejecuto (con_mecanica) -
-  // el usuario puede volver a "Todos" desde el FilterBar si quiere ver todo.
+  // origen queda FIJO en WKND (decision del usuario, 2026-07-14): el
+  // dashboard mide siempre la campana propia - el selector se saco del
+  // FilterBar. adopcion arranca en con_mecanica pero si es ajustable.
   const [campaignFilters, setCampaignFilters] = useState<CampaignFilters>({
     origen: 'WKND',
     adopcion: 'con_mecanica',
@@ -67,6 +75,9 @@ function App() {
   const [plataformaSegmento, setPlataformaSegmento] = useState<PlataformaSegmentoRow[]>([])
   const [usuariosSegmento, setUsuariosSegmento] = useState<UsuariosSegmentoRow[]>([])
   const [descuentoPlataformaSegmento, setDescuentoPlataformaSegmento] = useState<DescuentoPlataformaSegmentoRow[]>([])
+  const [enganche, setEnganche] = useState<EngancheRow[]>([])
+  const [engancheOrden, setEngancheOrden] = useState<EngancheOrdenRow[]>([])
+  const [engancheSegmento, setEngancheSegmento] = useState<EngancheSegmentoRow[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // Fila de "Performance FDS" seleccionada por click, para filtrar la tabla
@@ -117,8 +128,11 @@ function App() {
       fetchPlataformaSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
       fetchUsuariosSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
       fetchDescuentoPlataformaSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchEnganche(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchEngancheOrden(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
+      fetchEngancheSegmento(selected.CAMPAIGN_START, selected.CAMPAIGN_END, campaignFilters),
     ])
-      .then(([s, m, t, mp, su, catPlat, depPlat, catSeg, depSeg, ps, us, dps]) => {
+      .then(([s, m, t, mp, su, catPlat, depPlat, catSeg, depSeg, ps, us, dps, eng, engOrd, engSeg]) => {
         if (ignore) return
         setSummary(s)
         setMechanics(m)
@@ -132,6 +146,9 @@ function App() {
         setPlataformaSegmento(ps)
         setUsuariosSegmento(us)
         setDescuentoPlataformaSegmento(dps)
+        setEnganche(eng)
+        setEngancheOrden(engOrd)
+        setEngancheSegmento(engSeg)
       })
       .catch((e) => !ignore && setError(String(e)))
       .finally(() => !ignore && setLoading(false))
@@ -165,7 +182,7 @@ function App() {
     <div style={{ padding: '2rem', maxWidth: '1800px', margin: '0 auto' }}>
       <h1>Post-mortem de promos FDS</h1>
 
-      {campaigns.length === 0 && !error && <p>Cargando campanas...</p>}
+      {campaigns.length === 0 && !error && <p>Cargando campañas...</p>}
       {campaigns.length > 0 && (
         <CampaignSelector campaigns={campaigns} selected={selected} onChange={setSelected} />
       )}
@@ -180,8 +197,20 @@ function App() {
       <div style={{ opacity: loading ? 0.4 : 1, transition: 'opacity 0.15s' }}>
         {summary && (
           <section style={{ marginTop: '1.5rem' }}>
-            <h2>Resumen</h2>
-            <KpiCards summary={summary} mechanics={mechanics} />
+            <h2>Resultados de campaña</h2>
+            <KpiCards
+              summary={summary}
+              mechanics={mechanics}
+              segmentoUsuario={segmentoUsuario}
+              usuariosSegmento={usuariosSegmento}
+            />
+          </section>
+        )}
+
+        {(engancheOrden.length > 0 || enganche.length > 0) && (
+          <section style={{ marginTop: '1.5rem' }}>
+            <h2>Enganche: ticket completo</h2>
+            <EngancheTable porOrden={engancheOrden} porCliente={enganche} porSegmento={engancheSegmento} />
           </section>
         )}
 
@@ -198,7 +227,7 @@ function App() {
 
         {mechanics.length > 0 && (
           <section style={{ marginTop: '1.5rem' }}>
-            <h2>Tops de la campana</h2>
+            <h2>Tops de la campaña</h2>
             <TopChartsSection rows={mechanics} />
           </section>
         )}

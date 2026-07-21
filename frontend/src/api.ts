@@ -7,6 +7,9 @@ import type {
   DepartamentoPlataformaRow,
   DepartamentoSegmentoRow,
   DescuentoPlataformaSegmentoRow,
+  EngancheOrdenRow,
+  EngancheRow,
+  EngancheSegmentoRow,
   Filters,
   MarketplaceRow,
   MechanicRow,
@@ -92,6 +95,24 @@ export function fetchDescuentoPlataformaSegmento(
   filters?: CampaignFilters,
 ): Promise<DescuentoPlataformaSegmentoRow[]> {
   return getJson(`/campaigns/${start}/${end}/descuento-plataforma-segmento`, filters)
+}
+
+export function fetchEnganche(start: string, end: string, filters?: CampaignFilters): Promise<EngancheRow[]> {
+  // El backend solo aplica store_id/marketplace de estos filtros - los
+  // demas romperian la definicion de "ticket completo".
+  return getJson(`/campaigns/${start}/${end}/enganche`, filters)
+}
+
+export function fetchEngancheOrden(start: string, end: string, filters?: CampaignFilters): Promise<EngancheOrdenRow[]> {
+  return getJson(`/campaigns/${start}/${end}/enganche-orden`, filters)
+}
+
+export function fetchEngancheSegmento(
+  start: string,
+  end: string,
+  filters?: CampaignFilters,
+): Promise<EngancheSegmentoRow[]> {
+  return getJson(`/campaigns/${start}/${end}/enganche-segmento`, filters)
 }
 
 export function fetchCategoriaPlataforma(

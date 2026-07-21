@@ -10,7 +10,25 @@ Esta versión integra dos líneas de trabajo — el modelo económico y los dato
 
 ## Cómo correr la app
 
-Hay dos piezas: el **notebook** (arma la estrategia de un fin de semana nuevo, y mide el post-mortem de uno ya pasado) y el **dashboard** (backend + frontend, para consultar cualquier campaña ya subida sin volver al notebook).
+Tres comandos, uno por flujo — todos piden el login SSO por navegador una vez:
+
+```bash
+uv sync   # solo la primera vez
+
+# 1. Crear la estrategia del proximo finde y subir el plan (default: proximo viernes-domingo)
+uv run run_estrategias.py
+uv run run_estrategias.py --inicio 2026-07-18 --fin 2026-07-20   # ventana explicita
+
+# 2. Post-mortem completo de una campana ya ejecutada (default: la ultima subida)
+#    Imprime el resumen en consola y genera el reporte HTML en data/output/
+uv run run_postmortem.py
+uv run run_postmortem.py --inicio 2026-07-11 --fin 2026-07-13
+
+# 3. Dashboard interactivo (backend :8000 + frontend :3000 con un solo comando)
+./run_dashboard.sh
+```
+
+`--help` en cualquiera de los dos `.py` muestra todas las opciones (filtros, `--sin-subir`, `--sin-refrescar`, etc.).
 
 ### Requisitos
 
@@ -18,20 +36,17 @@ Hay dos piezas: el **notebook** (arma la estrategia de un fin de semana nuevo, y
 - Node.js (solo para el dashboard).
 - Acceso a Snowflake vía SSO (login por navegador, `authenticator="externalbrowser"`) — configurar `.env` a partir de `.env.example` con tu correo `@justo.mx`.
 
-### Notebook (`src/exploration.ipynb`)
+### Notebook (`src/exploration.ipynb`) — solo exploración
+
+El notebook sigue existiendo para explorar celda por celda y para casos raros que los scripts no cubren (ej. subir un plan real con formato de Excel no estándar, como las hojas GENRAL/Cervezas/Limpieza de la campaña 11-13 jul):
 
 ```bash
-uv sync
 uv run jupyter lab src/exploration.ipynb
 ```
 
-Correr las celdas en orden:
-1. Imports + parámetros (`RUTA_OPORTUNIDAD`, `WEEKEND_INICIO`/`WEEKEND_FIN` — ajustar al fin de semana que corresponda).
-2. Conexión a Snowflake (SSO, abre el navegador una vez).
-3. Si `WEEKEND_FIN` **todavía no pasó**: "Construir la estrategia" arma y sube el plan automáticamente.
-4. Si `WEEKEND_FIN` **ya pasó**: usar la celda "Subir manualmente el plan real de una promo ya pasada" (lee el Excel que de verdad se ejecutó) y luego la sección "Medir una promo ya pasada" (`performance_por_mecanica`, `top_skus`, `validar_redencion_real`) — la última celda genera siempre un reporte HTML autónomo en `data/output/` con esos tres resultados.
+El flujo estándar (crear estrategia / medir post-mortem) ya no requiere el notebook — usar los scripts de arriba.
 
-### Dashboard (backend + frontend)
+### Dashboard a mano (si no quieres el script)
 
 ```bash
 # Backend (puerto 8000) - abre el navegador para el login SSO al arrancar
@@ -43,7 +58,7 @@ npm install
 npm run dev
 ```
 
-Abrir `http://localhost:3000` — el selector de campañas lee directo de `WKND_PROMO_PLAN`, así que cualquier plan subido desde el notebook aparece ahí sin pasos extra.
+Abrir `http://localhost:3000` — el selector de campañas lee directo de `WKND_PROMO_PLAN`, así que cualquier plan subido aparece ahí sin pasos extra.
 
 ## De dónde salen los datos
 

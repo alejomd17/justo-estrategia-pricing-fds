@@ -50,17 +50,10 @@ export default function FilterBar({ filters, value, onChange }: Props) {
         ))}
       </select>
 
-      <select
-        value={value.origen ?? ''}
-        onChange={(e) => onChange({ ...value, origen: e.target.value || undefined })}
-      >
-        <option value="">Todos los origenes</option>
-        {filters.origenes.map((o) => (
-          <option key={o} value={o}>
-            {o}
-          </option>
-        ))}
-      </select>
+      {/* Selector de origen sacado a proposito (decision del usuario,
+          2026-07-14): el dashboard mide SIEMPRE la campana propia (WKND) -
+          el origen queda fijo en el estado inicial de App.tsx. El backend
+          sigue aceptando ?origen= por si algun dia se quiere de vuelta. */}
 
       <select
         value={value.adopcion ?? ''}

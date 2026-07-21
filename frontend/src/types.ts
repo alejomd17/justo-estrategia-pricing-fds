@@ -137,6 +137,40 @@ export interface DescuentoPlataformaSegmentoRow {
   MARGEN_PROMEDIO: number | null
 }
 
+export interface EngancheSegmentoRow {
+  SEGMENTO_USUARIO: string | null
+  GRUPO: string
+  USUARIOS: number
+  GMV_TOTAL: number | null
+  GMV_CAMPANA: number | null
+  TICKET_TOTAL_PROMEDIO: number | null
+  GASTO_CAMPANA_PROMEDIO: number | null
+  GASTO_RESTO_PROMEDIO: number | null
+  PCT_CAMPANA_EN_TICKET: number | null
+}
+
+export interface EngancheOrdenRow {
+  GRUPO: string
+  ORDENES: number
+  GMV_TOTAL: number | null
+  GMV_CAMPANA: number | null
+  TICKET_PROMEDIO_ORDEN: number | null
+  GASTO_CAMPANA_PROMEDIO: number | null
+  GASTO_RESTO_PROMEDIO: number | null
+  PCT_CAMPANA_EN_TICKET: number | null
+}
+
+export interface EngancheRow {
+  GRUPO: string
+  USUARIOS: number
+  GMV_TOTAL: number | null
+  GMV_CAMPANA: number | null
+  TICKET_TOTAL_PROMEDIO: number | null
+  GASTO_CAMPANA_PROMEDIO: number | null
+  GASTO_RESTO_PROMEDIO: number | null
+  PCT_CAMPANA_EN_TICKET: number | null
+}
+
 export interface TopSkuRow {
   SKU: number
   STORE_ID: number

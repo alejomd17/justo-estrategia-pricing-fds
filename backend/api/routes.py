@@ -324,6 +324,50 @@ def campaign_descuento_plataforma_segmento(
     return df_to_records(df)
 
 
+@router.get("/campaigns/{campaign_start}/{campaign_end}/enganche")
+def campaign_enganche(
+    campaign_start: date,
+    campaign_end: date,
+    store_id: Optional[int] = None,
+    marketplace: Optional[str] = None,
+    cur=Depends(get_cursor),
+):
+    # Solo tienda/plataforma - filtrar por categoria/mecanica romperia la
+    # definicion de "ticket completo" (ver docstring de la funcion).
+    df = postmortem.resumen_enganche_ticket(
+        cur, pd.Timestamp(campaign_start), pd.Timestamp(campaign_end), store_id, marketplace
+    )
+    return df_to_records(df)
+
+
+@router.get("/campaigns/{campaign_start}/{campaign_end}/enganche-segmento")
+def campaign_enganche_segmento(
+    campaign_start: date,
+    campaign_end: date,
+    store_id: Optional[int] = None,
+    marketplace: Optional[str] = None,
+    cur=Depends(get_cursor),
+):
+    df = postmortem.resumen_enganche_por_segmento(
+        cur, pd.Timestamp(campaign_start), pd.Timestamp(campaign_end), store_id, marketplace
+    )
+    return df_to_records(df)
+
+
+@router.get("/campaigns/{campaign_start}/{campaign_end}/enganche-orden")
+def campaign_enganche_orden(
+    campaign_start: date,
+    campaign_end: date,
+    store_id: Optional[int] = None,
+    marketplace: Optional[str] = None,
+    cur=Depends(get_cursor),
+):
+    df = postmortem.resumen_enganche_por_orden(
+        cur, pd.Timestamp(campaign_start), pd.Timestamp(campaign_end), store_id, marketplace
+    )
+    return df_to_records(df)
+
+
 @router.get("/campaigns/{campaign_start}/{campaign_end}/redemption")
 def campaign_redemption(campaign_start: date, campaign_end: date, cur=Depends(get_cursor)):
     df = postmortem.validar_redencion_real(cur, pd.Timestamp(campaign_start), pd.Timestamp(campaign_end))
